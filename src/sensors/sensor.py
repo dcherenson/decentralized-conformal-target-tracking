@@ -10,7 +10,8 @@ class Sensor:
     def __init__(self, sensor_id: int, 
                  noise_model: Optional[Callable] = None, 
                  measurement_dim: Optional[int] = None,
-                 measurement_function: Optional[Callable] = None):
+                 measurement_function: Optional[Callable] = None,
+                 measurement_jacobian: Optional[Callable] = None):
         """
         Initialize a sensor.
         
@@ -19,11 +20,13 @@ class Sensor:
             noise_model: Function that generates noise (takes measurement_dim, returns noise vector)
             measurement_dim: Dimension of measurements (if None, inferred from truth value)
             measurement_function: Transformation function h(x, w) that takes state and noise, returns measurement
+            measurement_jacobian: Jacobian of measurement model H(x) for EKF
         """
         self.id = sensor_id
         self.noise_model = noise_model
         self.measurement_dim = measurement_dim
         self.measurement_function = measurement_function  # h(x, w)
+        self.measurement_jacobian = measurement_jacobian
         self.measurement_history = []
         
     def measure(self, truth_value: np.ndarray) -> np.ndarray:
@@ -39,11 +42,12 @@ class Sensor:
         truth_value = np.array(truth_value, dtype=float)
         
         # Generate noise w
+        noise_dim = self.measurement_dim or truth_value.shape[0]
         if self.noise_model is not None:
-            noise = self.noise_model(truth_value.shape[0])
+            noise = self.noise_model(noise_dim)
         else:
             # Default: Gaussian noise with std=0.1
-            noise = np.random.randn(*truth_value.shape) * 0.1
+            noise = np.random.randn(noise_dim) * 0.1
         
         # Apply measurement transformation h(x, w)
         if self.measurement_function is not None:
@@ -68,6 +72,15 @@ class Sensor:
             measurement_function: Callable that takes (state, noise) and returns measurement
         """
         self.measurement_function = measurement_function
+
+    def set_measurement_jacobian(self, measurement_jacobian: Callable):
+        """
+        Set the measurement Jacobian H(x) for EKF.
+
+        Args:
+            measurement_jacobian: Callable that takes state and returns Jacobian
+        """
+        self.measurement_jacobian = measurement_jacobian
     
     def get_measurement_history(self) -> np.ndarray:
         """Return the measurement history as a numpy array."""
@@ -117,3 +130,146 @@ class UniformNoise:
     def __call__(self, dim: int) -> np.ndarray:
         """Generate uniform noise vector."""
         return np.random.uniform(self.low, self.high, dim)
+
+
+class RangeSensor(Sensor):
+    """Range-only sensor measuring distance to origin in 2D."""
+
+    def __init__(self, sensor_id: int, noise_model: Optional[Callable] = None):
+        def measurement_function(state: np.ndarray, noise: np.ndarray) -> np.ndarray:
+            x, y = state[0], state[1]
+            r = np.sqrt(x * x + y * y)
+            return np.array([r + noise[0]], dtype=float)
+
+        def measurement_jacobian(state: np.ndarray) -> np.ndarray:
+            x, y = state[0], state[1]
+            r = np.sqrt(x * x + y * y)
+            if r == 0.0:
+                return np.zeros((1, state.shape[0]))
+            H = np.zeros((1, state.shape[0]))
+            H[0, 0] = x / r
+            H[0, 1] = y / r
+            return H
+
+        super().__init__(
+            sensor_id=sensor_id,
+            noise_model=noise_model,
+            measurement_dim=1,
+            measurement_function=measurement_function,
+            measurement_jacobian=measurement_jacobian,
+        )
+
+
+class RangeBearingSensor(Sensor):
+    """Range-bearing sensor measuring distance and angle to origin in 2D."""
+
+    def __init__(self, sensor_id: int, noise_model: Optional[Callable] = None):
+        def measurement_function(state: np.ndarray, noise: np.ndarray) -> np.ndarray:
+            x, y = state[0], state[1]
+            r = np.sqrt(x * x + y * y)
+            theta = np.arctan2(y, x)
+            # Add noise to range and bearing, then emit range, cos(bearing), sin(bearing).
+            theta_noisy = theta + noise[1]
+            return np.array(
+                [
+                    r + noise[0],
+                    np.cos(theta_noisy),
+                    np.sin(theta_noisy),
+                ],
+                dtype=float,
+            )
+
+        def measurement_jacobian(state: np.ndarray) -> np.ndarray:
+            x, y = state[0], state[1]
+            r2 = x * x + y * y
+            r = np.sqrt(r2)
+            if r == 0.0:
+                return np.zeros((3, state.shape[0]))
+            H = np.zeros((3, state.shape[0]))
+            dtheta_dx = -y / r2
+            dtheta_dy = x / r2
+            theta = np.arctan2(y, x)
+
+            # Range derivative.
+            H[0, 0] = x / r
+            H[0, 1] = y / r
+
+            # cos(theta) derivative.
+            H[1, 0] = -np.sin(theta) * dtheta_dx
+            H[1, 1] = -np.sin(theta) * dtheta_dy
+
+            # sin(theta) derivative.
+            H[2, 0] = np.cos(theta) * dtheta_dx
+            H[2, 1] = np.cos(theta) * dtheta_dy
+            return H
+
+        super().__init__(
+            sensor_id=sensor_id,
+            noise_model=noise_model,
+            measurement_dim=3,
+            measurement_function=measurement_function,
+            measurement_jacobian=measurement_jacobian,
+        )
+
+    def measure(self, truth_value: np.ndarray) -> np.ndarray:
+        """Override measure to generate noise only on range and bearing."""
+        truth_value = np.array(truth_value, dtype=float)
+
+        if self.noise_model is not None:
+            noise = self.noise_model(2)
+        else:
+            noise = np.random.randn(2) * 0.1
+
+        measurement = self.measurement_function(truth_value, noise)
+        self.measurement_history.append(measurement.copy())
+        return measurement
+
+
+class PositionSensor(Sensor):
+    """Position sensor measuring x, y from state [x, y, ...]."""
+
+    def __init__(self, sensor_id: int, noise_model: Optional[Callable] = None):
+        def measurement_function(state: np.ndarray, noise: np.ndarray) -> np.ndarray:
+            x, y = state[0], state[1]
+            return np.array([x + noise[0], y + noise[1]], dtype=float)
+
+        def measurement_jacobian(state: np.ndarray) -> np.ndarray:
+            H = np.zeros((2, state.shape[0]))
+            H[0, 0] = 1.0
+            H[1, 1] = 1.0
+            return H
+
+        super().__init__(
+            sensor_id=sensor_id,
+            noise_model=noise_model,
+            measurement_dim=2,
+            measurement_function=measurement_function,
+            measurement_jacobian=measurement_jacobian,
+        )
+
+
+class VelocitySensor(Sensor):
+    """Velocity-only sensor measuring vx, vy from state [x, y, vx, vy]."""
+
+    def __init__(self, sensor_id: int, noise_model: Optional[Callable] = None):
+        def measurement_function(state: np.ndarray, noise: np.ndarray) -> np.ndarray:
+            if state.shape[0] < 4:
+                raise ValueError("VelocitySensor requires state with at least 4 elements")
+            vx, vy = state[2], state[3]
+            return np.array([vx + noise[0], vy + noise[1]], dtype=float)
+
+        def measurement_jacobian(state: np.ndarray) -> np.ndarray:
+            if state.shape[0] < 4:
+                raise ValueError("VelocitySensor requires state with at least 4 elements")
+            H = np.zeros((2, state.shape[0]))
+            H[0, 2] = 1.0
+            H[1, 3] = 1.0
+            return H
+
+        super().__init__(
+            sensor_id=sensor_id,
+            noise_model=noise_model,
+            measurement_dim=2,
+            measurement_function=measurement_function,
+            measurement_jacobian=measurement_jacobian,
+        )

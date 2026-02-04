@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Optional
+from typing import Optional, Callable
 
 
 class Target:
@@ -7,7 +7,13 @@ class Target:
     A target with dynamics model for motion prediction.
     """
     
-    def __init__(self, target_id: int, initial_position: np.ndarray, initial_velocity: Optional[np.ndarray] = None):
+    def __init__(
+        self,
+        target_id: int,
+        initial_position: np.ndarray,
+        initial_velocity: Optional[np.ndarray] = None,
+        process_noise_model: Optional[Callable[[int], np.ndarray]] = None,
+    ):
         """
         Initialize a target.
         
@@ -24,12 +30,19 @@ class Target:
         # Dynamics model
         self.dynamics_model = None  # Can be set to a specific dynamics model
         
+        # Process noise model (e.g., Laplace or other heavy-tailed noise)
+        self.process_noise_model = process_noise_model
+
         # State history for tracking
         self.trajectory = [self.position.copy()]
         
     def set_dynamics_model(self, dynamics_model):
         """Set the dynamics model for this target."""
         self.dynamics_model = dynamics_model
+
+    def set_process_noise_model(self, process_noise_model: Optional[Callable[[int], np.ndarray]]):
+        """Set the process noise model for target dynamics."""
+        self.process_noise_model = process_noise_model
     
     def update(self, dt: float, control_input: Optional[np.ndarray] = None):
         """
@@ -40,12 +53,24 @@ class Target:
             control_input: Optional control/disturbance input
         """
         if self.dynamics_model is not None:
-            self.position, self.velocity = self.dynamics_model.update(
-                self.position, self.velocity, control_input, dt
-            )
+            if hasattr(self.dynamics_model, "process_model"):
+                state = np.concatenate([self.position, self.velocity])
+                next_state = self.dynamics_model.process_model(state, control_input, dt)
+                dim = self.position.shape[0]
+                self.position = next_state[:dim]
+                self.velocity = next_state[dim:]
+            else:
+                self.position, self.velocity = self.dynamics_model.update(
+                    self.position, self.velocity, control_input, dt
+                )
         else:
             # Simple constant velocity motion if no dynamics model is set
             self.position += self.velocity * dt
+
+        # Add process noise (non-Gaussian if desired)
+        if self.process_noise_model is not None:
+            noise = self.process_noise_model(self.position.shape[0])
+            self.position = self.position + noise
             
         # Store trajectory
         self.trajectory.append(self.position.copy())
@@ -64,3 +89,22 @@ class Target:
     
     def __repr__(self):
         return f"Target(id={self.id}, pos={self.position}, vel={self.velocity})"
+
+
+class LaplaceNoise:
+    """Laplace (double exponential) noise model for target dynamics."""
+
+    def __init__(self, scale: float = 1.0, mean: float = 0.0):
+        """
+        Initialize Laplace noise model.
+
+        Args:
+            scale: Laplace scale (b). Larger means heavier tails.
+            mean: Mean of the Laplace distribution.
+        """
+        self.scale = scale
+        self.mean = mean
+
+    def __call__(self, dim: int) -> np.ndarray:
+        """Generate Laplace noise vector."""
+        return np.random.laplace(self.mean, self.scale, dim)

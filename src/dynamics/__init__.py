@@ -1,3 +1,5 @@
 """Dynamics models for robots and targets."""
 
-__all__ = []
+from .motion_model import ConstantVelocityModel
+
+__all__ = ["ConstantVelocityModel"]

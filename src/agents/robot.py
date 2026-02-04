@@ -24,6 +24,9 @@ class Robot:
         # Target tracking module
         self.tracking_module = None  # Can be set to a specific tracking algorithm
         self.tracked_targets = {}  # Dictionary to store tracked target states
+
+        # Conformal prediction module
+        self.conformal_module = None
         
         # Dynamics
         self.dynamics_model = None  # Can be set to a specific dynamics model
@@ -50,6 +53,10 @@ class Robot:
     def set_tracking_module(self, tracking_module):
         """Set the target tracking module for this robot."""
         self.tracking_module = tracking_module
+
+    def set_conformal_module(self, conformal_module):
+        """Set the conformal prediction module for this robot."""
+        self.conformal_module = conformal_module
     
     def set_dynamics_model(self, dynamics_model):
         """Set the dynamics model for this robot."""
