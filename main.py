@@ -1,10 +1,14 @@
 """Main entry point for the decentralized conformal target tracking system."""
 
+import matplotlib
 import numpy as np
 from scipy.stats import norm
 import random
 import networkx as nx
 
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 from examples.generate_random_trajectories import generate_random_trajectories
 from examples.plot_trajectories import (
     plot_trajectories,
@@ -249,14 +253,25 @@ def main():
         estimates[agent.id] = np.zeros((sim_steps, 2), dtype=float)
         covariances[agent.id] = np.zeros((sim_steps, 2, 2), dtype=float)
         sim_scores[agent.id] = []
+        agent.conformal_module.dist_quantile_estimate = 0.0
 
-    dcp_steps = 10
-
+    dcp_steps = 1000
+    avg_values=[]
     avg_data_per_agent = num_cal_data
     for k in range(dcp_steps):
         agent_values = np.array([agent.conformal_module.dist_quantile_estimate for agent in agents])
         for agent in agents:
-            agent.conformal_module.run_distributed_subgradient_step(agent_values, num_cal_data)
+            agent.conformal_module.run_distributed_subgradient_step(k, agent_values, avg_data_per_agent)
+        avg_values.append(np.mean(agent_values))
+
+    plt.figure()
+    plt.plot(range(dcp_steps), avg_values, label="Average Quantile Estimate")
+    plt.xlabel("DCP Step")
+    plt.ylabel("Quantile Estimate")
+    plt.title("Distributed Conformal Prediction Quantile Estimates")
+    plt.grid(True)
+    plt.savefig("dcp_quantile_estimates.png", dpi=150)
+    plt.close()
 
     print("Distributed subgradient quantile estimates:")
     for agent in agents:

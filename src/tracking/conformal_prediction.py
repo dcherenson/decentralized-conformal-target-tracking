@@ -17,7 +17,8 @@ class ConformalPredictionModule:
         self.alpha: float = alpha  # Default miscoverage level
         # For distributed subgradient method
         self.dist_quantile_estimate: float = 0.0
-        self.step_size: float = 0.001
+        self.step_size_base: float = 0.1
+        self.step_count: int = 0
         self.weights: np.ndarray = weights
 
     def calibrate(self, scores: np.ndarray) -> float:
@@ -68,15 +69,16 @@ class ConformalPredictionModule:
         self.dist_quantile_estimate = initial_quantile
 
 
-    def run_distributed_subgradient_step(self, values: np.ndarray, data_per_agent : float):
+    def run_distributed_subgradient_step(self, step: int, values: np.ndarray, data_per_agent : float):
         """ Run distributed subgradient step across multiple agents. """
-        self.dist_quantile_estimate -= self.step_size * self.compute_subgradient_pinball_loss(
+        current_step_size = self.step_size_base #/ np.sqrt(step+ 1)
+        averaged_estimate = sum(weight * value for weight, value in zip(self.weights, values))
+        gradient = self.compute_subgradient_pinball_loss(
             self.dist_quantile_estimate,
             self.residuals,
             (1 - self.alpha) * (1 + 1 / data_per_agent),
         )
-        for (value, weight) in zip(values, self.weights):
-            self.dist_quantile_estimate += weight * value
+        self.dist_quantile_estimate = averaged_estimate - current_step_size * gradient
         
 
     def compute_subgradient_pinball_loss(self, quantile_estimate: float, residuals: np.ndarray, gamma: float) -> float:
