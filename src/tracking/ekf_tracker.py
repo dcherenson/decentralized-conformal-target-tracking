@@ -82,9 +82,10 @@ class EKFTracker(TrackingModule):
         predicted_measurement = self.measurement_model.measurement_function(
             self.state_estimate,
             noise,
+            self.measurement_model.position,
         )
 
-        H = self.measurement_jacobian(self.state_estimate)
+        H = self.measurement_jacobian(self.state_estimate, self.measurement_model.position)
         R = self.R
         innovation = measurement - predicted_measurement
         

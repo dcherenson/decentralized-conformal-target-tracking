@@ -64,6 +64,9 @@ class Robot:
     
     def add_sensor(self, sensor: Sensor):
         """Add a sensor to this robot."""
+        # Place the sensor at the robot's current position.
+        if hasattr(sensor, "set_position"):
+            sensor.set_position(self.position)
         self.sensors[sensor.id] = sensor
     
     def remove_sensor(self, sensor_id: int):

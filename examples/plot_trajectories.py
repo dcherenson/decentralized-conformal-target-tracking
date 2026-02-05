@@ -14,6 +14,16 @@ import matplotlib.pyplot as plt
 from scipy.stats import norm
 from matplotlib.patches import Ellipse
 
+# Global plot style for readability.
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.titlesize": 16,
+    "axes.labelsize": 14,
+    "legend.fontsize": 12,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+})
+
 
 def load_labels(path: str) -> np.ndarray:
     if path.endswith(".npz"):
@@ -68,6 +78,7 @@ def plot_simulation_with_ellipses(
     quantiles: dict[int, float] | None = None,
     nominal_scale: float | None = None,
     nominal_violations: dict[int, np.ndarray] | None = None,
+    agent_positions: dict[int, np.ndarray] | None = None,
     save_path: str | None = None,
     show: bool = False,
     ellipse_step: int = 5,
@@ -77,13 +88,20 @@ def plot_simulation_with_ellipses(
         raise ValueError("truth must have shape (T, 2)")
 
     plt.figure(figsize=(7, 7))
-    plt.plot(truth[:, 0], truth[:, 1], "k-", label="Truth")
+    plt.plot(truth[:, 0], truth[:, 1], "k-", label="Truth", linewidth=2.5)
 
     for agent_id, est in estimates.items():
-        plt.plot(est[:, 0], est[:, 1], label=f"Agent {agent_id} estimate")
+        plt.plot(est[:, 0], est[:, 1], label=f"Estimate", linewidth=2.0)
 
     for agent_id, covs in covariances.items():
-        for t in range(0, covs.shape[0], ellipse_step):
+        violation_idx = (
+            set(nominal_violations.get(agent_id, []))
+            if nominal_violations is not None
+            else set()
+        )
+        for t in range(covs.shape[0]):
+            if (t % ellipse_step != 0) and (t not in violation_idx):
+                continue
             cov = covs[t]
             vals, vecs = np.linalg.eigh(cov)
             order = np.argsort(vals)[::-1]
@@ -101,8 +119,10 @@ def plot_simulation_with_ellipses(
                 angle=angle,
                 fill=False,
                 alpha=0.4,
+                edgecolor="red",
                 linestyle="--",
-                label=f"Agent {agent_id} nominal" if t == 0 else None,
+                linewidth=2.0,
+                label=f"Uncalibrated Miscoverage" if t == 0 else None,
             )
             plt.gca().add_patch(ellipse_nominal)
 
@@ -117,7 +137,9 @@ def plot_simulation_with_ellipses(
                     angle=angle,
                     fill=False,
                     alpha=0.4,
-                    label=f"Agent {agent_id} calibrated" if t == 0 else None,
+                    edgecolor="green",
+                    linewidth=2.0,
+                    label=f"Calibrated Coverage" if t == 0 else None,
                 )
                 plt.gca().add_patch(ellipse_cal)
 
@@ -128,9 +150,21 @@ def plot_simulation_with_ellipses(
                 truth[idx, 0],
                 truth[idx, 1],
                 color="red",
-                s=25,
+                s=90,
                 marker="x",
                 label=f"Agent {agent_id} nominal violation",
+            )
+
+    # Plot agent positions.
+    if agent_positions is not None:
+        for agent_id, pos in agent_positions.items():
+            plt.scatter(
+                pos[0],
+                pos[1],
+                color="black",
+                s=160,
+                marker="^",
+                label=f"Agent {agent_id} position",
             )
 
     plt.title("Target Truth, EKF Estimates, and Covariance Ellipses")
@@ -164,15 +198,15 @@ def plot_position_time_with_sigma(
     time = np.arange(truth.shape[0])
 
     fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
-    axes[0].plot(time, truth[:, 0], "k-", label="Truth x")
-    axes[1].plot(time, truth[:, 1], "k-", label="Truth y")
+    axes[0].plot(time, truth[:, 0], "k-", label="Truth Target x", linewidth=2.5)
+    axes[1].plot(time, truth[:, 1], "k-", label="Truth Target y", linewidth=2.5)
 
     # Use two-sided Gaussian quantile for nominal band.
     z = float(norm.ppf(1 - alpha / 2))
 
     for agent_id, est in estimates.items():
-        axes[0].plot(time, est[:, 0], label=f"Agent {agent_id} x")
-        axes[1].plot(time, est[:, 1], label=f"Agent {agent_id} y")
+        axes[0].plot(time, est[:, 0], label=f"Estimated Target x", linewidth=2.0)
+        axes[1].plot(time, est[:, 1], label=f"Estimated Target y", linewidth=2.0)
 
         covs = covariances[agent_id]
         sigma_x = np.sqrt(covs[:, 0, 0])
@@ -182,14 +216,14 @@ def plot_position_time_with_sigma(
             est[:, 0] - z * sigma_x,
             est[:, 0] + z * sigma_x,
             alpha=0.15,
-            label=f"Agent {agent_id} nominal",
+            label=f"Uncalibrated Uncertainty",
         )
         axes[1].fill_between(
             time,
             est[:, 1] - z * sigma_y,
             est[:, 1] + z * sigma_y,
             alpha=0.15,
-            label=f"Agent {agent_id} nominal",
+            label=f"Uncalibrated Uncertainty",
         )
 
         if quantiles is not None and agent_id in quantiles:
@@ -199,14 +233,14 @@ def plot_position_time_with_sigma(
                 est[:, 0] - q * sigma_x,
                 est[:, 0] + q * sigma_x,
                 alpha=0.1,
-                label=f"Agent {agent_id} calibrated",
+                label=f"Calibrated Uncertainty",
             )
             axes[1].fill_between(
                 time,
                 est[:, 1] - q * sigma_y,
                 est[:, 1] + q * sigma_y,
                 alpha=0.1,
-                label=f"Agent {agent_id} calibrated",
+                label=f"Calibrated Uncertainty",
             )
 
         if nominal_violations is not None and agent_id in nominal_violations:
@@ -215,17 +249,17 @@ def plot_position_time_with_sigma(
                 time[violation_idx],
                 truth[violation_idx, 0],
                 color="red",
-                s=20,
+                s=60,
                 marker="x",
-                label=f"Agent {agent_id} nominal violation",
+                label=f"Uncalibrated Miscoverage",
             )
             axes[1].scatter(
                 time[violation_idx],
                 truth[violation_idx, 1],
                 color="red",
-                s=20,
+                s=60,
                 marker="x",
-                label=f"Agent {agent_id} nominal violation",
+                label=f"Uncalibrated Miscoverage",
             )
 
     axes[0].set_ylabel("x")
@@ -235,7 +269,7 @@ def plot_position_time_with_sigma(
     axes[1].grid(True, alpha=0.3)
     axes[0].legend()
     axes[1].legend()
-    fig.suptitle("Position vs Time with Nominal and Calibrated Bands")
+    fig.suptitle("Position vs Time with Uncalibrated and Calibrated Bands")
     fig.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150)

@@ -2,6 +2,8 @@
 
 import numpy as np
 from scipy.stats import norm
+import random
+import networkx as nx
 
 from examples.generate_random_trajectories import generate_random_trajectories
 from examples.plot_trajectories import (
@@ -17,10 +19,68 @@ from src.tracking.ekf_tracker import EKFTracker
 from src.tracking.conformal_prediction import ConformalPredictionModule
 
 
+def generate_random_connected_graph(n, p_extra=0.1):
+    """
+    Generates a connected graph with N nodes and random edges.
+    
+    Args:
+        n (int): Number of nodes.
+        p_extra (float): Probability of adding an extra edge between any 
+                         unconnected pair after the spanning tree is built.
+    """
+    if n <= 1:
+        return nx.complete_graph(n)
+
+    # 1. Create the graph and add nodes
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+
+    # 2. Guarantee Connectivity (Random Spanning Tree)
+    # We shuffle nodes to ensure the 'backbone' isn't just 0-1-2-3...
+    nodes_list = list(G.nodes())
+    random.shuffle(nodes_list)
+    
+    # Connect node i to i+1 to form a random path (backbone)
+    for i in range(n - 1):
+        G.add_edge(nodes_list[i], nodes_list[i + 1])
+
+    # 3. Add extra random edges
+    # Iterate through all possible pairs
+    for i in range(n):
+        for j in range(i + 1, n):
+            # If edge doesn't exist, add it with probability p_extra
+            if not G.has_edge(i, j):
+                if random.random() < p_extra:
+                    G.add_edge(i, j)
+    
+    return nx.adjacency_matrix(G).toarray()
+
+def get_metropolis_weights(adj_matrix):
+    n = adj_matrix.shape[0]
+    degrees = np.sum(adj_matrix, axis=1) # Vector of degrees
+    W = np.zeros((n, n))
+
+    # 1. Fill off-diagonal weights
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adj_matrix[i][j] == 1:
+                # Weight is 1 / max(degree_i, degree_j)
+                weight = 1.0 / max(degrees[i], degrees[j])
+                W[i][j] = weight
+                W[j][i] = weight # Keep it symmetric!
+
+    # 2. Fill diagonal (Self-loops)
+    # The diagonal must make the row sum to 1
+    for i in range(n):
+        W[i][i] = 1.0 - np.sum(W[i, :])
+        
+    return W
+
+
 def main():
     """Main function - create agents and generate calibration data."""
     # Fixed seed for reproducibility across runs.
-    base_seed = 123
+    base_seed = 1338
     np.random.seed(base_seed)
 
     # Shared sensor noise model and motion model for all agents.
@@ -28,12 +88,12 @@ def main():
     bearing_noise_std = 0.05
 
     def range_bearing_noise_model(dim: int) -> np.ndarray:
-        # Noise model for range and bearing (theta) only.
+        # Laplace noise model for range and bearing (theta) only.
         if dim < 2:
             raise ValueError("Range-bearing noise model requires dim >= 2")
         noise = np.zeros(dim, dtype=float)
-        noise[0] = np.random.normal(0.0, range_noise_std)
-        noise[1] = np.random.normal(0.0, bearing_noise_std)
+        noise[0] = np.random.randn() * range_noise_std
+        noise[1] = np.random.randn() * bearing_noise_std
         return noise
 
     motion_model = ConstantVelocityModel(dim=2)
@@ -48,11 +108,24 @@ def main():
     ])
 
     # Create agents with sensors, EKFs, and conformal modules.
-    agents = []
-    for agent_id in range(3):
+    num_agents = 5
+    alpha = 0.1
+
+    # make a random fully connected graph adjacency matrix
+    adjacency_matrix = generate_random_connected_graph(num_agents, p_extra=0.5)
+
+    print(adjacency_matrix)
+
+    weights = get_metropolis_weights(adjacency_matrix)
+
+    print("Metropolis Weights:")
+    print(weights)
+
+    agents : list[Robot] = []
+    for agent_id in range(5):
         robot = Robot(
             robot_id=agent_id,
-            initial_position=np.zeros(2),
+            initial_position=np.array([float(agent_id)+2.5, 1.5], dtype=float)
         )
         # Each agent uses a range-bearing sensor with shared noise model.
         sensor = RangeBearingSensor(sensor_id=agent_id, noise_model=range_bearing_noise_model)
@@ -70,7 +143,7 @@ def main():
             )
         )
         # Conformal module per agent for calibration.
-        robot.set_conformal_module(ConformalPredictionModule(module_id=agent_id))
+        robot.set_conformal_module(ConformalPredictionModule(module_id=agent_id, weights=weights[agent_id], alpha=alpha))
         agents.append(robot)
 
     for agent in agents:
@@ -78,13 +151,14 @@ def main():
 
     # Generate calibration datasets for each agent.
     calibration_sets = []
+    num_cal_data = 50
     dt = 0.1
     T = 50
-    initial_velocity_std = 0.2
-    initial_velocity_mean = 0.1
+    initial_velocity_std = 0.5
+    initial_velocity_mean = 0.0
     for agent in agents:
         features, labels = generate_random_trajectories(
-            num_trajectories=25,
+            num_trajectories=num_cal_data,
             length=T,
             dt=dt,
             dim=2,
@@ -105,7 +179,6 @@ def main():
         )
 
     # Compute conformal quantiles using max Mahalanobis score per trajectory.
-    alpha = 0.05
     for agent, (_, labels) in zip(agents, calibration_sets):
         ekf = agent.tracking_module
         if ekf is None:
@@ -137,8 +210,9 @@ def main():
 
         scores = np.array(scores, dtype=float)
         print(f"Agent {agent.id} scores: {scores}")
-        quantile = agent.conformal_module.calibrate(scores, alpha)
+        quantile = agent.conformal_module.calibrate(scores)
         print(f"Agent {agent.id} conformal quantile (alpha={alpha}): {quantile:.4f}")
+        agent.conformal_module.initialize_distributed_subgradient(quantile)
 
     # Save a plot of the first agent's calibration trajectories.
     plot_trajectories(
@@ -157,7 +231,7 @@ def main():
         target_id=0,
         initial_position=np.zeros(2),
         # Match calibration initial velocity distribution.
-        initial_velocity=rng.normal(initial_velocity_mean, initial_velocity_std, size=2),
+        initial_velocity=np.array([0.0, 1.0]) #rng.normal(initial_velocity_mean, initial_velocity_std, size=2),
     )
     target.set_dynamics_model(motion_model)
 
@@ -171,10 +245,25 @@ def main():
         ekf = agent.tracking_module
         if ekf is None:
             raise ValueError("Agent is missing EKF tracker")
-        ekf.reset(initial_state=np.array([0.1, 0.1, 0.0, 0.0]), initial_covariance=np.eye(4))
+        ekf.reset(initial_state=np.array([0.0, 0.0, 0.0, 0.0]), initial_covariance=np.eye(4))
         estimates[agent.id] = np.zeros((sim_steps, 2), dtype=float)
         covariances[agent.id] = np.zeros((sim_steps, 2, 2), dtype=float)
         sim_scores[agent.id] = []
+
+    dcp_steps = 10
+
+    avg_data_per_agent = num_cal_data
+    for k in range(dcp_steps):
+        agent_values = np.array([agent.conformal_module.dist_quantile_estimate for agent in agents])
+        for agent in agents:
+            agent.conformal_module.run_distributed_subgradient_step(agent_values, num_cal_data)
+
+    print("Distributed subgradient quantile estimates:")
+    for agent in agents:
+        print(f"Agent {agent.id}: {agent.conformal_module.dist_quantile_estimate:.4f}")
+
+
+    exit()
 
     # Simulate target motion and EKF updates per agent.
     for t in range(sim_steps):
@@ -216,6 +305,8 @@ def main():
         quantiles={0: agents[0].conformal_module.quantile(alpha)},
         nominal_scale=nominal_scale,
         nominal_violations={0: nominal_violation_idx},
+        agent_positions={0: agents[0].position},
+        ellipse_step=10,
         save_path="simulation.png",
         show=False,
     )

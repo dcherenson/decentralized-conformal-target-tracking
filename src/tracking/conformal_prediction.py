@@ -11,11 +11,16 @@ class ConformalPredictionModule:
     Stores calibration scores and produces symmetric prediction intervals.
     """
 
-    def __init__(self, module_id: int):
+    def __init__(self, module_id: int, weights: np.ndarray, alpha: float = 0.1):
         self.id = module_id
         self.residuals: np.ndarray | None = None
+        self.alpha: float = alpha  # Default miscoverage level
+        # For distributed subgradient method
+        self.dist_quantile_estimate: float = 0.0
+        self.step_size: float = 0.001
+        self.weights: np.ndarray = weights
 
-    def calibrate(self, scores: np.ndarray, alpha: float) -> float:
+    def calibrate(self, scores: np.ndarray) -> float:
         """Store calibration scores and return conformal quantile."""
         scores = np.array(scores, dtype=float)
         if scores.ndim != 1:
@@ -23,7 +28,7 @@ class ConformalPredictionModule:
         if scores.size == 0:
             raise ValueError("scores must be non-empty")
         self.residuals = scores
-        return self.quantile(alpha)
+        return self.quantile(self.alpha)
 
     def compute_mahalanobis_score(
         self,
@@ -57,14 +62,36 @@ class ConformalPredictionModule:
         n = self.residuals.size
         q = np.ceil((n + 1) * (1 - alpha)) / n
         return float(np.quantile(self.residuals, q, method="higher"))
+    
+    def initialize_distributed_subgradient(self, initial_quantile: float):
+        """ Initialize distributed subgradient  across multiple agents. """
+        self.dist_quantile_estimate = initial_quantile
 
-    def predict_interval(self, y_pred: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray]:
-        """Return symmetric prediction interval around y_pred."""
-        y_pred = np.array(y_pred, dtype=float)
-        radius = self.quantile(alpha)
-        lower = y_pred - radius
-        upper = y_pred + radius
-        return lower, upper
+
+    def run_distributed_subgradient_step(self, values: np.ndarray, data_per_agent : float):
+        """ Run distributed subgradient step across multiple agents. """
+        self.dist_quantile_estimate -= self.step_size * self.compute_subgradient_pinball_loss(
+            self.dist_quantile_estimate,
+            self.residuals,
+            (1 - self.alpha) * (1 + 1 / data_per_agent),
+        )
+        for (value, weight) in zip(values, self.weights):
+            self.dist_quantile_estimate += weight * value
+        
+
+    def compute_subgradient_pinball_loss(self, quantile_estimate: float, residuals: np.ndarray, gamma: float) -> float:
+        """ Compute subgradient of pinball loss for quantile estimation. """
+        if residuals is None or residuals.size == 0:
+            raise ValueError("Module is not calibrated")
+        n = residuals.size
+        subgradient = 0.0
+        for r in residuals:
+            if r < quantile_estimate:
+                subgradient += (1 - gamma)
+            else:
+                subgradient += -gamma
+        subgradient /= n
+        return subgradient
 
     def __repr__(self) -> str:
         n = 0 if self.residuals is None else self.residuals.size
