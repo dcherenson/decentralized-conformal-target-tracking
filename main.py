@@ -5,6 +5,7 @@ import numpy as np
 from scipy.stats import norm
 import random
 import networkx as nx
+import os
 
 matplotlib.use("Agg")
 
@@ -84,7 +85,7 @@ def get_metropolis_weights(adj_matrix):
 def main():
     """Main function - create agents and generate calibration data."""
     # Fixed seed for reproducibility across runs.
-    base_seed = 1338
+    base_seed = 1
     np.random.seed(base_seed)
 
     # Shared sensor noise model and motion model for all agents.
@@ -96,8 +97,8 @@ def main():
         if dim < 2:
             raise ValueError("Range-bearing noise model requires dim >= 2")
         noise = np.zeros(dim, dtype=float)
-        noise[0] = np.random.randn() * range_noise_std
-        noise[1] = np.random.randn() * bearing_noise_std
+        noise[0] = np.random.laplace(scale=range_noise_std)
+        noise[1] = np.random.laplace(scale=bearing_noise_std)
         return noise
 
     motion_model = ConstantVelocityModel(dim=2)
@@ -112,7 +113,7 @@ def main():
     ])
 
     # Create agents with sensors, EKFs, and conformal modules.
-    num_agents = 5
+    num_agents = 10
     alpha = 0.1
 
     # make a random fully connected graph adjacency matrix
@@ -126,7 +127,7 @@ def main():
     print(weights)
 
     agents : list[Robot] = []
-    for agent_id in range(5):
+    for agent_id in range(num_agents):
         robot = Robot(
             robot_id=agent_id,
             initial_position=np.array([float(agent_id)+2.5, 1.5], dtype=float)
@@ -155,7 +156,7 @@ def main():
 
     # Generate calibration datasets for each agent.
     calibration_sets = []
-    num_cal_data = 50
+    num_cal_data = 25
     dt = 0.1
     T = 50
     initial_velocity_std = 0.5
@@ -173,7 +174,7 @@ def main():
             velocity_noise_std=0.05,
             turn_rate_std=0.05,
             # Use the agent's sensor and shared motion model.
-            sensor_model=RangeBearingSensor(sensor_id=agent.id, noise_model=range_bearing_noise_model),
+            sensor_model=agent.sensors[next(iter(agent.sensors))],
             motion_model=motion_model,
             seed=base_seed + agent.id,
         )
@@ -212,8 +213,8 @@ def main():
             # Store max Mahalanobis score for this trajectory.
             scores.append(max_score)
 
-        scores = np.array(scores, dtype=float)
-        print(f"Agent {agent.id} scores: {scores}")
+        # scores = np.array(scores, dtype=float)
+        # print(f"Agent {agent.id} scores: {scores}")
         quantile = agent.conformal_module.calibrate(scores)
         print(f"Agent {agent.id} conformal quantile (alpha={alpha}): {quantile:.4f}")
         agent.conformal_module.initialize_distributed_subgradient(quantile)
@@ -264,6 +265,20 @@ def main():
             agent.conformal_module.run_distributed_subgradient_step(k, agent_values, avg_data_per_agent)
         avg_values.append(np.mean(agent_values))
 
+    centralized_quantile = np.quantile(
+        np.concatenate(
+            [
+                agent.conformal_module.residuals
+                for agent in agents
+                if agent.conformal_module.residuals is not None
+            ]
+        ),
+        np.ceil((num_cal_data * len(agents) + len(agents)) * (1 - alpha)) / (num_cal_data * len(agents)),
+        method="higher",
+    )
+
+    print(f"Centralized conformal quantile (alpha={alpha}): {centralized_quantile:.4f}")
+
     plt.figure()
     plt.plot(range(dcp_steps), avg_values, label="Average Quantile Estimate")
     plt.xlabel("DCP Step")
@@ -278,7 +293,7 @@ def main():
         print(f"Agent {agent.id}: {agent.conformal_module.dist_quantile_estimate:.4f}")
 
 
-    exit()
+    # exit()
 
     # Simulate target motion and EKF updates per agent.
     for t in range(sim_steps):
@@ -331,11 +346,29 @@ def main():
         estimates={0: estimates[0]},
         covariances={0: covariances[0]},
         quantiles={0: agents[0].conformal_module.quantile(alpha)},
+        distributed_quantiles={0: agents[0].conformal_module.dist_quantile_estimate},
         alpha=alpha,
         nominal_violations={0: nominal_violation_idx},
         save_path="position_time.png",
         show=False,
     )
+
+    os.makedirs("plots", exist_ok=True)
+    for agent in agents:
+        agent_scores = np.array(sim_scores[agent.id], dtype=float)
+        nominal_scale = float(norm.ppf(1 - alpha / 2))
+        nominal_violation_idx = np.where(agent_scores > nominal_scale)[0]
+        plot_position_time_with_sigma(
+            truth=truth,
+            estimates={agent.id: estimates[agent.id]},
+            covariances={agent.id: covariances[agent.id]},
+            quantiles={agent.id: agent.conformal_module.quantile(alpha)},
+            distributed_quantiles={agent.id: agent.conformal_module.dist_quantile_estimate},
+            alpha=alpha,
+            nominal_violations={agent.id: nominal_violation_idx},
+            save_path=os.path.join("plots", f"position_time_agent_{agent.id}.png"),
+            show=False,
+        )
 
     for agent in agents:
         quantile = agent.conformal_module.quantile(alpha)

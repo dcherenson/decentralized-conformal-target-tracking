@@ -152,7 +152,7 @@ def plot_simulation_with_ellipses(
                 color="red",
                 s=90,
                 marker="x",
-                label=f"Agent {agent_id} nominal violation",
+                label=f"Miscoverage",
             )
 
     # Plot agent positions.
@@ -187,6 +187,7 @@ def plot_position_time_with_sigma(
     estimates: dict[int, np.ndarray],
     covariances: dict[int, np.ndarray],
     quantiles: dict[int, float] | None = None,
+    distributed_quantiles: dict[int, float] | None = None,
     alpha: float = 0.1,
     nominal_violations: dict[int, np.ndarray] | None = None,
     save_path: str | None = None,
@@ -217,6 +218,7 @@ def plot_position_time_with_sigma(
             est[:, 0] + z * sigma_x,
             alpha=0.15,
             label=f"Uncalibrated Uncertainty",
+            color="red",
         )
         axes[1].fill_between(
             time,
@@ -224,6 +226,7 @@ def plot_position_time_with_sigma(
             est[:, 1] + z * sigma_y,
             alpha=0.15,
             label=f"Uncalibrated Uncertainty",
+            color="red",
         )
 
         if quantiles is not None and agent_id in quantiles:
@@ -234,6 +237,7 @@ def plot_position_time_with_sigma(
                 est[:, 0] + q * sigma_x,
                 alpha=0.1,
                 label=f"Calibrated Uncertainty",
+                color="yellow",
             )
             axes[1].fill_between(
                 time,
@@ -241,6 +245,26 @@ def plot_position_time_with_sigma(
                 est[:, 1] + q * sigma_y,
                 alpha=0.1,
                 label=f"Calibrated Uncertainty",
+                color="yellow",
+            )
+
+        if distributed_quantiles is not None and agent_id in distributed_quantiles:
+            q_dist = distributed_quantiles[agent_id]
+            axes[0].fill_between(
+                time,
+                est[:, 0] - q_dist * sigma_x,
+                est[:, 0] + q_dist * sigma_x,
+                alpha=0.1,
+                label=f"Distributed Calibrated Uncertainty",
+                color="green",
+            )
+            axes[1].fill_between(
+                time,
+                est[:, 1] - q_dist * sigma_y,
+                est[:, 1] + q_dist * sigma_y,
+                alpha=0.1,
+                label=f"Distributed Calibrated Uncertainty",
+                color="green",
             )
 
         if nominal_violations is not None and agent_id in nominal_violations:
