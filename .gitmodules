@@ -1,0 +1,3 @@
+[submodule "multirobot_localization"]
+	path = multirobot_localization
+	url = git@github.com:tsangkai/multirobot_localization.git
