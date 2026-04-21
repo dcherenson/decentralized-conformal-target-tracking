@@ -80,3 +80,10 @@ This project uses:
 - PyTorch for neural network tracking modules
 - pytest for testing
 
+
+## Troubleshooting
+If pybullet doesn't install on Mac, run this
+```bash
+export CFLAGS="-Dfdopen=fdopen"
+uv sync
+```

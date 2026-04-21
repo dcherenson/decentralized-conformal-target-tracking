@@ -5,8 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "imageio>=2.37.0",
+    "imageio-ffmpeg>=0.6.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.1",
+    "pybullet>=3.2.7",
     "scipy>=1.17.0",
     "torch>=2.10.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
 ]
