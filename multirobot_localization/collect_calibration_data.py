@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 from math import atan2
 from pathlib import Path
 
@@ -33,8 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("multirobot_localization/calibration_dataset.json"),
-        help="Destination JSON file.",
+        default=Path("multirobot_localization/calibration_dataset.npz"),
+        help="Destination dataset file. Supported suffixes: .npz, .pkl, .pickle, .json.",
     )
     parser.add_argument(
         "--episodes",
@@ -285,12 +286,143 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _empty_sample_arrays(state_dim: int) -> dict[str, np.ndarray]:
+    return {
+        "episode_id": np.zeros((0,), dtype=np.int64),
+        "time_index": np.zeros((0,), dtype=np.int64),
+        "agent_id": np.zeros((0,), dtype=np.int64),
+        "epsilon": np.zeros((0,), dtype=np.float64),
+        "ground_truth_state": np.zeros((0, state_dim), dtype=np.float64),
+        "posterior_mean": np.zeros((0, state_dim), dtype=np.float64),
+        "posterior_covariance": np.zeros((0, state_dim, state_dim), dtype=np.float64),
+    }
+
+
+def _samples_to_numpy_arrays(
+    samples: list[dict[str, object]],
+    state_dim: int,
+) -> dict[str, np.ndarray]:
+    if not samples:
+        return _empty_sample_arrays(state_dim)
+
+    return {
+        "episode_id": np.asarray([sample["episode_id"] for sample in samples], dtype=np.int64),
+        "time_index": np.asarray([sample["time_index"] for sample in samples], dtype=np.int64),
+        "agent_id": np.asarray([sample["agent_id"] for sample in samples], dtype=np.int64),
+        "epsilon": np.asarray([sample["epsilon"] for sample in samples], dtype=np.float64),
+        "ground_truth_state": np.asarray(
+            [sample["ground_truth_state"] for sample in samples],
+            dtype=np.float64,
+        ).reshape((-1, state_dim)),
+        "posterior_mean": np.asarray(
+            [sample["posterior_mean"] for sample in samples],
+            dtype=np.float64,
+        ).reshape((-1, state_dim)),
+        "posterior_covariance": np.asarray(
+            [sample["posterior_covariance"] for sample in samples],
+            dtype=np.float64,
+        ).reshape((-1, state_dim, state_dim)),
+    }
+
+
+def save_calibration_dataset(path: Path, dataset: dict[str, object]) -> None:
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(dataset, handle, indent=2)
+        return
+
+    if suffix in {".pkl", ".pickle"}:
+        with path.open("wb") as handle:
+            pickle.dump(dataset, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        return
+
+    if suffix == ".npz":
+        metadata = dict(dataset["metadata"])
+        state_dim = 2 * int(metadata["num_agents"])
+        arrays: dict[str, np.ndarray] = {
+            "metadata_json": np.asarray(json.dumps(metadata), dtype=np.str_),
+        }
+
+        samples_by_class = dataset["samples_by_class"]
+        for agent_class in AgentClass:
+            class_name = agent_class.value
+            class_arrays = _samples_to_numpy_arrays(
+                samples=samples_by_class.get(class_name, []),
+                state_dim=state_dim,
+            )
+            for field_name, values in class_arrays.items():
+                arrays[f"{class_name}__{field_name}"] = values
+
+        np.savez_compressed(path, **arrays)
+        return
+
+    raise ValueError(
+        f"Unsupported dataset suffix '{path.suffix}'. "
+        "Use .npz, .pkl, .pickle, or .json."
+    )
+
+
+def load_calibration_dataset(path: Path) -> dict[str, object]:
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    if suffix in {".pkl", ".pickle"}:
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+
+    if suffix == ".npz":
+        with np.load(path) as archive:
+            metadata = json.loads(str(archive["metadata_json"]))
+            state_dim = 2 * int(metadata["num_agents"])
+            samples_by_class: dict[str, list[dict[str, object]]] = {}
+
+            for agent_class in AgentClass:
+                class_name = agent_class.value
+                episode_id = archive[f"{class_name}__episode_id"]
+                time_index = archive[f"{class_name}__time_index"]
+                agent_id = archive[f"{class_name}__agent_id"]
+                epsilon = archive[f"{class_name}__epsilon"]
+                ground_truth_state = archive[f"{class_name}__ground_truth_state"].reshape((-1, state_dim))
+                posterior_mean = archive[f"{class_name}__posterior_mean"].reshape((-1, state_dim))
+                posterior_covariance = archive[f"{class_name}__posterior_covariance"].reshape(
+                    (-1, state_dim, state_dim)
+                )
+
+                samples_by_class[class_name] = [
+                    {
+                        "episode_id": int(episode_id[idx]),
+                        "time_index": int(time_index[idx]),
+                        "agent_id": int(agent_id[idx]),
+                        "agent_class": class_name,
+                        "epsilon": float(epsilon[idx]),
+                        "ground_truth_state": ground_truth_state[idx].tolist(),
+                        "posterior_mean": posterior_mean[idx].tolist(),
+                        "posterior_covariance": posterior_covariance[idx].tolist(),
+                    }
+                    for idx in range(len(episode_id))
+                ]
+
+        return {
+            "metadata": metadata,
+            "samples_by_class": samples_by_class,
+        }
+
+    raise ValueError(
+        f"Unsupported dataset suffix '{path.suffix}'. "
+        "Use .npz, .pkl, .pickle, or .json."
+    )
+
+
 def main():
     args = parse_args()
     dataset = collect_dataset(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        json.dump(dataset, handle, indent=2)
+    save_calibration_dataset(args.output, dataset)
 
     samples_by_class = dataset["samples_by_class"]
     total_samples = sum(len(samples) for samples in samples_by_class.values())

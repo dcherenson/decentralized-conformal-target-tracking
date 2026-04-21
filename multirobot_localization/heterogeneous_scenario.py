@@ -9,6 +9,11 @@ import numpy as np
 import sim_env
 from agent_classes import AgentClass, normalize_agent_class
 from algorithm.gs_ci import GS_CI
+from formation_control import (
+    EstimateDrivenFormationController,
+    default_formation_targets,
+    default_render_altitude,
+)
 from robot import Robot
 from topology import sample_topologies
 
@@ -210,6 +215,8 @@ def simulate_class_conditional_gs_ci_rollout(
     observ_prob: float | None = None,
     comm_prob: float | None = None,
     ci_coeff: float = 0.8,
+    motion_mode: str = "random",
+    formation_controller: EstimateDrivenFormationController | None = None,
 ) -> dict[str, object]:
     """Run one heterogeneous GS-CI rollout and collect rendering diagnostics."""
 
@@ -220,6 +227,8 @@ def simulate_class_conditional_gs_ci_rollout(
     epsilon_by_class = epsilon_by_class or default_epsilon_by_class()
     class_quantiles = _normalized_quantiles(class_quantiles)
     agent_classes = agent_classes or alternating_agent_classes(sim_env.N)
+    if motion_mode not in {"random", "formation"}:
+        raise ValueError("motion_mode must be 'random' or 'formation'")
 
     initial_state = sample_initial_state(rng, jitter_std=initial_jitter_std)
     truth_robots = build_ground_truth_team(initial_state, agent_classes, epsilon_by_class)
@@ -249,6 +258,32 @@ def simulate_class_conditional_gs_ci_rollout(
     position_error = np.zeros((sim_env.N, num_steps), dtype=float)
     calibrated_cov_trace = np.zeros((sim_env.N, num_steps), dtype=float)
     raw_cov_trace = np.zeros((sim_env.N, num_steps), dtype=float)
+    truth_positions = np.zeros((sim_env.N, num_steps, 2), dtype=float)
+    estimated_positions = np.zeros((sim_env.N, num_steps, 2), dtype=float)
+    raw_covariances = np.zeros((sim_env.N, num_steps, 2, 2), dtype=float)
+    formation_position_error = np.full((sim_env.N, num_steps), np.nan, dtype=float)
+    render_altitude = np.zeros((sim_env.N, num_steps), dtype=float)
+    current_render_altitude = np.asarray(
+        [default_render_altitude(agent_class) for agent_class in agent_classes],
+        dtype=float,
+    )
+
+    controller_name = "random_odometry"
+    formation_targets: list[dict[str, object]] = []
+    static_obstacles: list[dict[str, object]] = []
+    target_positions_xyz = np.zeros((sim_env.N, 3), dtype=float)
+    controller = None
+    if motion_mode == "formation":
+        controller = formation_controller or EstimateDrivenFormationController(
+            formation_targets=default_formation_targets(agent_classes),
+        )
+        controller_name = controller.name
+        formation_targets = [target.to_dict() for target in controller.formation_targets]
+        static_obstacles = [obstacle.to_dict() for obstacle in controller.obstacles]
+        target_positions_xyz = np.asarray(
+            [controller.target_position_xyz(agent_id) for agent_id in range(sim_env.N)],
+            dtype=float,
+        )
 
     for step_id in range(num_steps):
         for agent_id in range(sim_env.N):
@@ -257,11 +292,36 @@ def simulate_class_conditional_gs_ci_rollout(
         nominal_inputs = [None] * sim_env.N
         realized_inputs = [None] * sim_env.N
         for agent_id, robot in enumerate(truth_robots):
-            nominal_inputs[agent_id], realized_inputs[agent_id] = sample_odometry_input(
-                robot=robot,
-                dt=dt,
-                rng=rng,
-            )
+            if controller is None:
+                nominal_inputs[agent_id], realized_inputs[agent_id] = sample_odometry_input(
+                    robot=robot,
+                    dt=dt,
+                    rng=rng,
+                )
+            else:
+                ii = 2 * agent_id
+                estimated_self_position = np.asarray(
+                    gs_ci_robots[agent_id].s[ii:ii + 2],
+                    dtype=float,
+                ).reshape(-1)
+                nominal_inputs[agent_id] = controller.compute_nominal_input(
+                    agent_id=agent_id,
+                    estimated_position_xy=estimated_self_position,
+                    current_theta=gs_ci_robots[agent_id].theta,
+                    robot=robot,
+                    dt=dt,
+                )
+                realized_inputs[agent_id] = controller.sample_realized_input(
+                    robot=robot,
+                    nominal_input=nominal_inputs[agent_id],
+                    dt=dt,
+                    rng=rng,
+                )
+                current_render_altitude[agent_id] = controller.update_render_altitude(
+                    agent_id=agent_id,
+                    current_altitude=current_render_altitude[agent_id],
+                    dt=dt,
+                )
 
         for agent_id in range(sim_env.N):
             truth_robots[agent_id].motion_propagation(realized_inputs[agent_id], dt)
@@ -315,9 +375,17 @@ def simulate_class_conditional_gs_ci_rollout(
             quantile = class_quantiles[agent_classes[agent_id]]
             calibrated_sigma_self = float(quantile) * sigma_self
 
+            truth_positions[agent_id, step_id] = truth_position
+            estimated_positions[agent_id, step_id] = estimate
+            raw_covariances[agent_id, step_id] = sigma_self
             position_error[agent_id, step_id] = float(np.linalg.norm(estimate - truth_position))
             raw_cov_trace[agent_id, step_id] = float(np.trace(sigma_self))
             calibrated_cov_trace[agent_id, step_id] = float(np.trace(calibrated_sigma_self))
+            render_altitude[agent_id, step_id] = float(current_render_altitude[agent_id])
+            if controller is not None:
+                formation_position_error[agent_id, step_id] = float(
+                    np.linalg.norm(estimate - target_positions_xyz[agent_id, :2])
+                )
 
             frame_poses.append(
                 {
@@ -326,17 +394,28 @@ def simulate_class_conditional_gs_ci_rollout(
                     "position_xy": truth_position.tolist(),
                     "theta": float(truth_robots[agent_id].theta),
                     "estimated_position_xy": estimate.tolist(),
+                    "target_position_xyz": target_positions_xyz[agent_id].tolist(),
+                    "formation_position_error": float(formation_position_error[agent_id, step_id]),
                     "position_error": float(position_error[agent_id, step_id]),
                     "raw_cov_trace": float(raw_cov_trace[agent_id, step_id]),
                     "calibrated_cov_trace": float(calibrated_cov_trace[agent_id, step_id]),
                     "quantile": float(quantile),
+                    "render_z": float(current_render_altitude[agent_id]),
+                    "nominal_input": [float(value) for value in nominal_inputs[agent_id]],
+                    "realized_input": [float(value) for value in realized_inputs[agent_id]],
                 }
             )
+
+        if controller is not None:
+            focus_points_xy = np.vstack((truth_positions[:, step_id, :], target_positions_xyz[:, :2]))
+        else:
+            focus_points_xy = truth_positions[:, step_id, :]
 
         frames.append(
             {
                 "step": int(step_id),
                 "team_state": capture_team_state(truth_robots).tolist(),
+                "camera_focus_xy": focus_points_xy.mean(axis=0).tolist(),
                 "poses": frame_poses,
             }
         )
@@ -347,7 +426,17 @@ def simulate_class_conditional_gs_ci_rollout(
         "filters": gs_ci_robots,
         "agent_classes": [agent_class.value for agent_class in agent_classes],
         "class_quantiles": {agent_class.value: float(q) for agent_class, q in class_quantiles.items()},
+        "motion_mode": motion_mode,
+        "controller_name": controller_name,
+        "formation_targets": formation_targets,
+        "static_obstacles": static_obstacles,
+        "target_positions_xyz": target_positions_xyz,
         "time": (np.arange(num_steps, dtype=float) * dt),
+        "truth_positions": truth_positions,
+        "estimated_positions": estimated_positions,
+        "raw_covariances": raw_covariances,
+        "render_altitude": render_altitude,
+        "formation_position_error": formation_position_error,
         "position_error": position_error,
         "raw_cov_trace": raw_cov_trace,
         "calibrated_cov_trace": calibrated_cov_trace,

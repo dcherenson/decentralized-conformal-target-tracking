@@ -167,3 +167,6 @@ cython_debug/
 
 
 *.png
+*.npz
+*.pkl
+*.tex

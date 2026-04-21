@@ -196,6 +196,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comm-prob", type=float, default=float(sim_env.comm_prob), help="Communication link probability.")
     parser.add_argument("--ci-coeff", type=float, default=0.8, help="Covariance intersection convex coefficient.")
     parser.add_argument(
+        "--motion-mode",
+        choices=("formation", "random"),
+        default="formation",
+        help="Whether to render estimate-driven formation control or the original random odometry motion.",
+    )
+    parser.add_argument(
         "--ugv-quantile",
         type=float,
         default=1.0,
@@ -254,6 +260,12 @@ def body_z_for(agent_class: AgentClass, args: argparse.Namespace) -> float:
     return float(args.uav_altitude)
 
 
+def pose_z_for(pose: dict[str, object], args: argparse.Namespace) -> float:
+    if "render_z" in pose:
+        return float(pose["render_z"])
+    return body_z_for(normalize_agent_class(pose["agent_class"]), args)
+
+
 def create_ground(pybullet, client_id: int):
     collision = pybullet.createCollisionShape(
         pybullet.GEOM_BOX,
@@ -271,6 +283,73 @@ def create_ground(pybullet, client_id: int):
         baseCollisionShapeIndex=collision,
         baseVisualShapeIndex=visual,
         basePosition=[0.0, 0.0, -0.05],
+        physicsClientId=client_id,
+    )
+
+
+def create_target_marker(pybullet, client_id: int, target: dict[str, object], agent_class: AgentClass) -> int:
+    x, y, z = [float(value) for value in target["position_xyz"]]
+    color = list(VISUAL_SPECS[agent_class].color_rgba[:3]) + [0.30]
+    visual = pybullet.createVisualShape(
+        shapeType=pybullet.GEOM_SPHERE,
+        radius=0.16 if agent_class == AgentClass.CLASS_B_UAV else 0.18,
+        rgbaColor=color,
+        specularColor=[0.16, 0.16, 0.16],
+        physicsClientId=client_id,
+    )
+    return pybullet.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=visual,
+        basePosition=[x, y, z],
+        physicsClientId=client_id,
+    )
+
+
+def create_static_obstacle_body(pybullet, client_id: int, obstacle: dict[str, object]) -> int:
+    primitive = str(obstacle["primitive"])
+    x, y, z = [float(value) for value in obstacle["position_xyz"]]
+    color = list(obstacle["color_rgba"])
+
+    if primitive == "box":
+        half_extents = [float(value) for value in obstacle["half_extents_xyz"]]
+        collision = pybullet.createCollisionShape(
+            pybullet.GEOM_BOX,
+            halfExtents=half_extents,
+            physicsClientId=client_id,
+        )
+        visual = pybullet.createVisualShape(
+            pybullet.GEOM_BOX,
+            halfExtents=half_extents,
+            rgbaColor=color,
+            specularColor=[0.15, 0.15, 0.15],
+            physicsClientId=client_id,
+        )
+    elif primitive == "cylinder":
+        radius = float(obstacle["radius"])
+        height = float(obstacle["height"])
+        collision = pybullet.createCollisionShape(
+            pybullet.GEOM_CYLINDER,
+            radius=radius,
+            height=height,
+            physicsClientId=client_id,
+        )
+        visual = pybullet.createVisualShape(
+            pybullet.GEOM_CYLINDER,
+            radius=radius,
+            length=height,
+            rgbaColor=color,
+            specularColor=[0.15, 0.15, 0.15],
+            physicsClientId=client_id,
+        )
+    else:
+        raise ValueError(f"Unsupported obstacle primitive '{primitive}'")
+
+    return pybullet.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=collision,
+        baseVisualShapeIndex=visual,
+        basePosition=[x, y, z],
         physicsClientId=client_id,
     )
 
@@ -320,7 +399,9 @@ def create_vehicle_body(pybullet, client_id: int, agent_id: int, agent_class: Ag
     collision = create_collision_shape(pybullet, client_id, agent_class)
     z = body_z_for(agent_class, args)
     body_id = pybullet.createMultiBody(
-        baseMass=1.0,
+        # The rollout already provides authoritative poses, so the render bodies
+        # should be kinematic and not participate in gravity-driven simulation.
+        baseMass=0.0,
         baseCollisionShapeIndex=collision,
         baseVisualShapeIndex=visual,
         basePosition=[0.0, 0.0, z],
@@ -339,10 +420,9 @@ def create_vehicle_body(pybullet, client_id: int, agent_id: int, agent_class: Ag
 
 
 def update_vehicle_pose(pybullet, client_id: int, body_id: int, pose: dict[str, object], args: argparse.Namespace):
-    agent_class = normalize_agent_class(pose["agent_class"])
     x, y = pose["position_xy"]
     yaw = float(pose["theta"])
-    z = body_z_for(agent_class, args)
+    z = pose_z_for(pose, args)
     orientation = pybullet.getQuaternionFromEuler([0.0, 0.0, yaw])
     pybullet.resetBasePositionAndOrientation(
         bodyUniqueId=body_id,
@@ -365,7 +445,7 @@ def update_agent_labels(pybullet, client_id: int, label_ids: dict[int, int], pos
     agent_id = int(pose["agent_id"])
     agent_class = normalize_agent_class(pose["agent_class"])
     x, y = pose["position_xy"]
-    z = body_z_for(agent_class, args) + 0.35
+    z = pose_z_for(pose, args) + 0.35
     color = VISUAL_SPECS[agent_class].color_rgba[:3]
     label = f"{agent_id} {'UGV' if agent_class == AgentClass.CLASS_A_UGV else 'UAV'}"
     previous_label_id = label_ids.get(agent_id, -1)
@@ -394,7 +474,7 @@ def update_trails(
     agent_id = int(pose["agent_id"])
     agent_class = normalize_agent_class(pose["agent_class"])
     x, y = pose["position_xy"]
-    z = body_z_for(agent_class, args)
+    z = pose_z_for(pose, args)
     current_position = [float(x), float(y), z]
     previous = previous_positions.get(agent_id)
     previous_positions[agent_id] = current_position
@@ -415,9 +495,14 @@ def update_trails(
 
 
 def frame_camera_target(frame: dict[str, object], args: argparse.Namespace) -> list[float]:
-    positions = np.array([pose["position_xy"] for pose in frame["poses"]], dtype=float)
-    centroid = positions.mean(axis=0)
-    return [float(centroid[0]), float(centroid[1]), float(args.camera_height)]
+    if "camera_focus_xy" in frame:
+        focus_xy = np.asarray(frame["camera_focus_xy"], dtype=float).reshape(2)
+    else:
+        positions = np.array([pose["position_xy"] for pose in frame["poses"]], dtype=float)
+        focus_xy = positions.mean(axis=0)
+    z_values = np.asarray([pose_z_for(pose, args) for pose in frame["poses"]], dtype=float)
+    focus_z = float(args.camera_height + 0.20 * np.mean(z_values))
+    return [float(focus_xy[0]), float(focus_xy[1]), focus_z]
 
 
 def reset_camera(pybullet, frame: dict[str, object], args: argparse.Namespace):
@@ -543,8 +628,12 @@ def save_metadata(output_path: Path, rollout: dict[str, object], args: argparse.
         "observ_prob": float(args.observ_prob),
         "comm_prob": float(args.comm_prob),
         "ci_coeff": float(args.ci_coeff),
+        "motion_mode": str(args.motion_mode),
+        "controller_name": rollout["controller_name"],
         "class_quantiles": rollout["class_quantiles"],
         "agent_classes": rollout["agent_classes"],
+        "formation_targets": rollout["formation_targets"],
+        "static_obstacles": rollout["static_obstacles"],
         "observ_topology_edges": rollout["observ_topology_edges"],
         "comm_topology_edges": rollout["comm_topology_edges"],
     }
@@ -557,8 +646,11 @@ def save_metrics(output_path: Path, rollout: dict[str, object]):
         output_path,
         time=np.asarray(rollout["time"], dtype=float),
         position_error=np.asarray(rollout["position_error"], dtype=float),
+        formation_position_error=np.asarray(rollout["formation_position_error"], dtype=float),
         raw_cov_trace=np.asarray(rollout["raw_cov_trace"], dtype=float),
         calibrated_cov_trace=np.asarray(rollout["calibrated_cov_trace"], dtype=float),
+        render_altitude=np.asarray(rollout["render_altitude"], dtype=float),
+        target_positions_xyz=np.asarray(rollout["target_positions_xyz"], dtype=float),
         agent_classes=np.asarray(rollout["agent_classes"]),
     )
 
@@ -577,6 +669,7 @@ def build_rollout(args: argparse.Namespace) -> dict[str, object]:
         observ_prob=args.observ_prob,
         comm_prob=args.comm_prob,
         ci_coeff=args.ci_coeff,
+        motion_mode=args.motion_mode,
     )
     if not rollout["frames"]:
         raise ValueError("`--steps` must be positive for rendering.")
@@ -617,6 +710,19 @@ def run(args: argparse.Namespace):
             pybullet.configureDebugVisualizer(pybullet.COV_ENABLE_SHADOWS, 1, physicsClientId=client_id)
 
         create_ground(pybullet, client_id)
+        obstacle_body_ids = [
+            create_static_obstacle_body(pybullet, client_id, obstacle)
+            for obstacle in rollout.get("static_obstacles", [])
+        ]
+        target_marker_ids = [
+            create_target_marker(
+                pybullet=pybullet,
+                client_id=client_id,
+                target=target,
+                agent_class=normalize_agent_class(rollout["agent_classes"][int(target["agent_id"])]),
+            )
+            for target in rollout.get("formation_targets", [])
+        ]
 
         body_ids: dict[int, int] = {}
         label_ids: dict[int, int] = {}
@@ -646,6 +752,7 @@ def run(args: argparse.Namespace):
             )
 
         playback_delay = max(float(args.dt) / max(float(args.playback_speed), 1.0e-6), 0.0)
+        _ = obstacle_body_ids, target_marker_ids
 
         while True:
             for frame in frames:

@@ -39,6 +39,28 @@ For boundedness analysis, just run `boundedness_sim.py`.
 
 For topology analysis, please run `topology_sim.py`.
 
+To generate cooperative-localization plots with top-down uncertainty tubes and DCP quantile histories:
+
+```bash
+python multirobot_localization/collect_calibration_data.py \
+  --output multirobot_localization/calibration_dataset.npz
+
+python multirobot_localization/plot_dcp_localization.py \
+  --calibration-dataset multirobot_localization/calibration_dataset.npz
+```
+
+This writes the plots to `multirobot_localization/output/`. The collector also supports `.pkl`, `.pickle`, and `.json`, but `.npz` is the default.
+
+To render the estimate-driven 3D formation scenario with static obstacles:
+
+```bash
+uv run python multirobot_localization/render_pybullet_scene.py \
+  --motion-mode formation \
+  --show-trails
+```
+
+The renderer now drives each agent toward a fixed 3D formation slot using its local state estimate, renders translucent target markers for those slots, and includes static 3D obstacles as future inputs to a CBF-style safety filter.
+
 
 
 ## Covariance Boundedness
