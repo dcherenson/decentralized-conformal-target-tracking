@@ -204,7 +204,7 @@ class RangeBearingSensor(Sensor):
     def __init__(self, sensor_id: int, noise_model: Optional[Callable] = None,
                  position: Optional[np.ndarray] = None,
                  max_range: float = 3.0,
-                 far_noise_scale: float = 0.00001):
+                 far_noise_scale: float = 0.0):
         # Noise scaling for far targets.
         self.max_range = max_range
         self.far_noise_scale = far_noise_scale

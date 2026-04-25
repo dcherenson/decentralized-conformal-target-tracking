@@ -76,6 +76,7 @@ def plot_simulation_with_ellipses(
     estimates: dict[int, np.ndarray],
     covariances: dict[int, np.ndarray],
     quantiles: dict[int, float] | None = None,
+    distributed_quantiles: dict[int, float] | None = None,
     nominal_scale: float | None = None,
     nominal_violations: dict[int, np.ndarray] | None = None,
     agent_positions: dict[int, np.ndarray] | None = None,
@@ -100,7 +101,7 @@ def plot_simulation_with_ellipses(
             else set()
         )
         for t in range(covs.shape[0]):
-            if (t % ellipse_step != 0) and (t not in violation_idx):
+            if (t % ellipse_step != 0):# and (t not in violation_idx):
                 continue
             cov = covs[t]
             vals, vecs = np.linalg.eigh(cov)
@@ -142,6 +143,23 @@ def plot_simulation_with_ellipses(
                     label=f"Calibrated Coverage" if t == 0 else None,
                 )
                 plt.gca().add_patch(ellipse_cal)
+
+            # Distributed calibrated ellipse.
+            if distributed_quantiles is not None and agent_id in distributed_quantiles:
+                q_dist = distributed_quantiles[agent_id]
+                width_d, height_d = 2 * q_dist * np.sqrt(vals)
+                ellipse_dist = Ellipse(
+                    xy=center,
+                    width=width_d,
+                    height=height_d,
+                    angle=angle,
+                    fill=False,
+                    alpha=0.4,
+                    edgecolor="blue",
+                    linewidth=2.0,
+                    label=f"Distributed Calibrated Coverage" if t == 0 else None,
+                )
+                plt.gca().add_patch(ellipse_dist)
 
     # Mark nominal violations at truth positions.
     if nominal_violations is not None:
@@ -237,7 +255,7 @@ def plot_position_time_with_sigma(
                 est[:, 0] + q * sigma_x,
                 alpha=0.1,
                 label=f"Calibrated Uncertainty",
-                color="yellow",
+                color="green",
             )
             axes[1].fill_between(
                 time,
@@ -245,7 +263,7 @@ def plot_position_time_with_sigma(
                 est[:, 1] + q * sigma_y,
                 alpha=0.1,
                 label=f"Calibrated Uncertainty",
-                color="yellow",
+                color="green",
             )
 
         if distributed_quantiles is not None and agent_id in distributed_quantiles:
@@ -256,7 +274,7 @@ def plot_position_time_with_sigma(
                 est[:, 0] + q_dist * sigma_x,
                 alpha=0.1,
                 label=f"Distributed Calibrated Uncertainty",
-                color="green",
+                color="blue",
             )
             axes[1].fill_between(
                 time,
@@ -264,7 +282,7 @@ def plot_position_time_with_sigma(
                 est[:, 1] + q_dist * sigma_y,
                 alpha=0.1,
                 label=f"Distributed Calibrated Uncertainty",
-                color="green",
+                color="blue",
             )
 
         if nominal_violations is not None and agent_id in nominal_violations:

@@ -82,6 +82,48 @@ def get_metropolis_weights(adj_matrix):
     return W
 
 
+def generate_positions_with_comm_range(
+    adj_matrix: np.ndarray,
+    max_range: float,
+    seed: int,
+    max_attempts: int = 2000,
+) -> np.ndarray:
+    """Generate 2D positions so all connected agents are within max_range."""
+    n = adj_matrix.shape[0]
+    rng = np.random.default_rng(seed)
+    positions = np.zeros((n, 2), dtype=float)
+    placed = [False] * n
+
+    positions[0] = np.array([0.0, 0.0], dtype=float)
+    placed[0] = True
+
+    for i in range(1, n):
+        neighbor_idxs = [j for j in range(n) if adj_matrix[i][j] == 1 and placed[j]]
+        if not neighbor_idxs:
+            neighbor_idxs = [placed.index(True)]
+
+        success = False
+        for _ in range(max_attempts):
+            anchor = positions[neighbor_idxs[0]]
+            angle = rng.uniform(0.0, 2 * np.pi)
+            radius = rng.uniform(0.0, max_range)
+            candidate = anchor + radius * np.array([np.cos(angle), np.sin(angle)])
+            if all(
+                np.linalg.norm(candidate - positions[j]) <= max_range
+                for j in neighbor_idxs
+            ):
+                positions[i] = candidate
+                placed[i] = True
+                success = True
+                break
+        if not success:
+            raise ValueError(
+                f"Could not place agent {i} within {max_range}m of its neighbors"
+            )
+
+    return positions
+
+
 def main():
     """Main function - create agents and generate calibration data."""
     # Fixed seed for reproducibility across runs.
@@ -126,11 +168,30 @@ def main():
     print("Metropolis Weights:")
     print(weights)
 
+    comm_range = 2.0
+    agent_positions = generate_positions_with_comm_range(
+        adjacency_matrix,
+        comm_range,
+        seed=base_seed,
+    )
+
+    plt.figure()
+    plt.scatter(agent_positions[:, 0], agent_positions[:, 1], c="blue", label="Agents")
+    plt.title("Agent Positions with Communication Range")
+    plt.xlabel("X Position")
+    plt.ylabel("Y Position")
+    for i in range(num_agents):
+        plt.text(agent_positions[i, 0], agent_positions[i, 1], f"{i}", fontsize=9, ha="right")
+    plt.grid(True)
+    plt.savefig("agent_positions.png", dpi=150)
+    plt.close()
+
     agents : list[Robot] = []
     for agent_id in range(num_agents):
         robot = Robot(
             robot_id=agent_id,
-            initial_position=np.array([float(agent_id)+2.5, 1.5], dtype=float)
+            initial_position=np.array([2.5, 1.5], dtype=float)
+            # initial_position=agent_positions[agent_id],
         )
         # Each agent uses a range-bearing sensor with shared noise model.
         sensor = RangeBearingSensor(sensor_id=agent_id, noise_model=range_bearing_noise_model)
@@ -279,6 +340,8 @@ def main():
 
     print(f"Centralized conformal quantile (alpha={alpha}): {centralized_quantile:.4f}")
 
+    # print(f"Average of individual agent quantiles: {np.mean([agent.conformal_module.quantile(alpha) for agent in agents]):.4f}")
+
     plt.figure()
     plt.plot(range(dcp_steps), avg_values, label="Average Quantile Estimate")
     plt.xlabel("DCP Step")
@@ -333,6 +396,7 @@ def main():
         estimates={0: estimates[0]},
         covariances={0: covariances[0]},
         quantiles={0: agents[0].conformal_module.quantile(alpha)},
+        distributed_quantiles={0: agents[0].conformal_module.dist_quantile_estimate},
         nominal_scale=nominal_scale,
         nominal_violations={0: nominal_violation_idx},
         agent_positions={0: agents[0].position},
@@ -358,6 +422,19 @@ def main():
         agent_scores = np.array(sim_scores[agent.id], dtype=float)
         nominal_scale = float(norm.ppf(1 - alpha / 2))
         nominal_violation_idx = np.where(agent_scores > nominal_scale)[0]
+        plot_simulation_with_ellipses(
+            truth=truth,
+            estimates={agent.id: estimates[agent.id]},
+            covariances={agent.id: covariances[agent.id]},
+            quantiles={agent.id: agent.conformal_module.quantile(alpha)},
+            distributed_quantiles={agent.id: agent.conformal_module.dist_quantile_estimate},
+            nominal_scale=nominal_scale,
+            nominal_violations={agent.id: nominal_violation_idx},
+            agent_positions={agent.id: agent.position},
+            ellipse_step=10,
+            save_path=os.path.join("plots", f"simulation_agent_{agent.id}.png"),
+            show=False,
+        )
         plot_position_time_with_sigma(
             truth=truth,
             estimates={agent.id: estimates[agent.id]},
