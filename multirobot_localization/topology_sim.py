@@ -1,3 +1,5 @@
+"""Sweep random topologies and aggregate RMSE/RMTE per localization method."""
+
 import sys
 sys.path.append("algorithm/")
 
@@ -19,6 +21,7 @@ from ls_sci import LS_SCI
 from ls_bda import LS_BDA
 
 
+# Experiment controls copied from the shared sim environment.
 num_of_trial = sim_env.num_of_trial
 total_T = sim_env.total_T
 
@@ -30,6 +33,7 @@ M = sim_env.M     # number of landmark
 dt = sim_env.dt
 
 
+# Running averages over sampled topologies.
 rmse_arr = {
 	'LS-Cen': 0.0,
 	'LS-CI': 0.0,
@@ -55,7 +59,7 @@ for iter_of_topology in range(num_of_topology):
 	initial = sim_env.initial_position
 
 
-	# Robot Initialization
+	# Build estimator/team objects for one sampled topology instance.
 	robots = [None] * N
 
 	ls_cen_team = LS_Cen(initial.copy())
@@ -83,6 +87,7 @@ for iter_of_topology in range(num_of_topology):
 
 
 	### Network Topology
+	# Topologies are generated once and read back from disk for legacy parity.
 	topo_file = open('topology/output.txt', 'r')
 
 	observ_topology = topology.Topology(N)
@@ -106,7 +111,7 @@ for iter_of_topology in range(num_of_topology):
 	topo_file.close()
 
 
-	# LS-Cen topology
+	# LS-Cen needs all-to-all comm for relative observations.
 	ls_cen_observ_topology = topology.Topology(N)
 	all_to_all_comm = True
 	for i in range(N):
@@ -120,7 +125,7 @@ for iter_of_topology in range(num_of_topology):
 			if edge[1] == N:
 				ls_cen_observ_topology.add_edge(edge[0], edge[1])
 
-	# LS-CI and LS-SCI topology
+	# LS-CI/LS-SCI keep absolute observations plus relative edges with comm links.
 	ls_ci_observ_topology = topology.Topology(N)
 	for edge in observ_topology.edges:
 		if edge[1] == sim_env.N: # absolute observation
@@ -129,7 +134,7 @@ for iter_of_topology in range(num_of_topology):
 		elif edge in comm_topology.edges:  # relative obseravion
 			ls_ci_observ_topology.add_edge(edge[0], edge[1])
 
-	# LS-BDA topology
+	# LS-BDA requires reciprocal communication for relative observations.
 	ls_bda_observ_topology = topology.Topology(N)
 	for edge in observ_topology.edges:
 		if edge[1] == sim_env.N: # absolute observation
@@ -140,6 +145,7 @@ for iter_of_topology in range(num_of_topology):
 
 
 	### Simulation
+	# Each timestep: sync headings, propagate, observe, communicate.
 	for t in range(total_T):
  
 		# reset theta
@@ -153,7 +159,7 @@ for iter_of_topology in range(num_of_topology):
 			# gs_sci_robots[n].theta = robots[n].theta
 
 
-		# motion propagation 
+		# motion propagation
 		odometry_input = [0] * N
 		odometry_star_input = [0] * N
 
@@ -235,6 +241,7 @@ for iter_of_topology in range(num_of_topology):
 
 
 	# Error Calculation
+	# Aggregate end-of-run RMSE and RMTE for this topology sample.
 
 	gs_ci_se = 0
 	gs_ci_te = 0
@@ -287,6 +294,7 @@ for iter_of_topology in range(num_of_topology):
 
 
 
+# Persist one row per communication probability sweep point.
 rmse_file = open('topology_result/rmse.txt', 'a')
 rmse_file.write(str(sim_env.comm_prob) + ', ' + str(rmse_arr['LS-Cen']) + ', ' + str(rmse_arr['LS-CI']) + ', ' + str(rmse_arr['LS-SCI']) + ', ' +  str(rmse_arr['LS-BDA']) + ', ' + str(rmse_arr['GS-CI']) +'\n')
 rmse_file.close()

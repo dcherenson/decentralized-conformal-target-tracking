@@ -1,3 +1,5 @@
+"""Centralized least-squares baseline estimator."""
+
 from numpy import matrix
 from math import cos, sin, atan2, sqrt
 
@@ -9,7 +11,7 @@ class LS_Cen:
 
 
 	def __init__(self , initial_s):
-
+		# Global stacked state and covariance for all agents.
 		self.s = initial_s.copy()
 		self.sigma = sim_env.initial_cov.copy()
 
@@ -18,7 +20,7 @@ class LS_Cen:
 
 
 	def motion_propagation_update(self, odometry_input, dt):
-
+		# Predict each agent block using shared stacked-state dynamics.
 		for i in range(sim_env.N):
 			[v, omega] = odometry_input[i]
 
@@ -37,6 +39,7 @@ class LS_Cen:
 
 	def ablt_obsv_update(self, idx, obs_value, landmark):
 		ii = 2*idx
+		# Landmark observation update for agent idx.
 
 		H_i = matrix([[0,0,0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0,0,0]], dtype=float)
 		H_i[0, ii] = -1
@@ -63,6 +66,7 @@ class LS_Cen:
 	def rela_obsv_update(self, idx, obs_idx, obs_value):
 		i = 2*idx
 		j = 2*obs_idx
+		# Relative observation update between observer and observed robot.
 
 
 		H_ij = matrix([[0,0,0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0,0,0]], dtype=float)
@@ -86,7 +90,6 @@ class LS_Cen:
 
 		self.s = self.s + kalman_gain*(z - hat_z)
 		self.sigma = self.sigma - kalman_gain*H*self.sigma
-
 
 
 

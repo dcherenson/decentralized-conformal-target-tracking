@@ -1,3 +1,5 @@
+"""LS-SCI variant with split covariance and conservative relative fusion."""
+
 from numpy import matrix
 from math import cos, sin, atan2, sqrt
 
@@ -12,7 +14,7 @@ class LS_SCI:
 
 
 	def __init__(self , initial_s):
-
+		# Split covariance into independent and dependent components.
 		self.s = initial_s.copy()
 		self.sigma_i = 0.99 * sim_env.initial_cov.copy()
 		self.sigma_d = 0.01 * sim_env.initial_cov.copy()
@@ -22,7 +24,7 @@ class LS_SCI:
 
 
 	def motion_propagation_update(self, odometry_input, dt):
-
+		# Motion prediction updates state and independent covariance part.
 		for i in range(sim_env.N):
 			[v, omega] = odometry_input[i]
 
@@ -42,6 +44,7 @@ class LS_SCI:
 
 	def ablt_obsv_update(self, idx, obs_value, landmark):
 		ii = 2*idx
+		# Absolute update uses total covariance, then re-splits posterior.
 		total_sigma = self.sigma_i + self.sigma_d
 
 		H_i = matrix([[0,0,0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0,0,0]], dtype=float)
@@ -74,6 +77,7 @@ class LS_SCI:
 	def rela_obsv_update(self, idx, obs_idx, obs_value):
 		ii = 2*idx
 		jj = 2*obs_idx
+		# Relative update applies SCI-style conservative covariance weighting.
 
 		ci_coeff = 0.83
 
@@ -96,5 +100,5 @@ class LS_SCI:
 
 
 	def getSigma(self):
+		# Return full covariance for downstream plotting/evaluation.
 		return self.sigma_i + self.sigma_d
-

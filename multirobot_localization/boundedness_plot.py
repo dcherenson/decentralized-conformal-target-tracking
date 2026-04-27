@@ -1,4 +1,4 @@
-
+"""Plot boundedness experiment outputs (error vs covariance traces)."""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,6 +7,7 @@ import sim_env
 
 
 
+# Consistent per-method colors reused in both subplots.
 color_red = '#DC4C46'
 color_blue = '#2F4A92'
 color_green = '#47785E'
@@ -28,6 +29,7 @@ time_arr = np.linspace(0, sim_env.total_T*sim_env.dt, num=sim_env.total_T)
 
 result_dir = 'boundedness_result/'
 
+### Load method traces from disk
 ### LS Cen
 ls_cen_tr = np.empty(T)
 ls_cen_error = np.empty(T)
@@ -154,6 +156,7 @@ gs_sci_file.close()
 '''
 
 ### Performance Plot
+# Top panel: RMSE trajectories. Bottom panel: RMTE / bounds.
 
 y_lim = [0, 0.34]
 x_lim = [0, sim_env.total_T*sim_env.dt]
@@ -212,4 +215,3 @@ plt.ylim(y_lim_extra)
 plt.savefig(result_dir + 'performance.png')
 
 plt.show()
-

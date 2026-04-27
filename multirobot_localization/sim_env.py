@@ -1,3 +1,5 @@
+"""Shared simulation constants and geometry/noise helper utilities."""
+
 import numpy as np
 
 from math import cos, sin, atan2, sqrt
@@ -82,21 +84,25 @@ landmark_position = [0.01, 0.02]
 origin = [0.0, 0.0]
 
 def inRange(a, b):
+	"""Check whether point a is inside sensing/operation radius around b."""
 	if sqrt( (a[0]-b[0])**2 + (a[1]-b[1])**2 ) > d_max:
 		return False
 	else:
 		return True
 
 class Landmark:
+	"""Simple landmark container used by observation updates."""
 
 	def __init__(self, index, position):
 		self.index = index
 		self.position = position
 
 def rot_mtx(theta):
+	"""2D rotation matrix."""
 	return np.matrix([[cos(theta), -sin(theta)], [sin(theta), cos(theta)]])
 
 def relative_measurement(pos_1, theta_1, pos_2):
+	"""Noisy range-bearing measurement from pose 1 to point/pose 2."""
 
 	delta_x = pos_2[0] - pos_1[0]
 	delta_y = pos_2[1] - pos_1[1]
@@ -104,6 +110,5 @@ def relative_measurement(pos_1, theta_1, pos_2):
 	phi = atan2(delta_y, delta_x) + np.random.normal(0, sqrt(var_phi)) - theta_1
 
 	return [dis, phi]
-
 
 

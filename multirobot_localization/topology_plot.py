@@ -1,4 +1,4 @@
-
+"""Plot topology-sweep RMSE/RMTE summaries from CSV outputs."""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,6 +8,7 @@ import sim_env
 
 
 
+# Color palette keyed by algorithm for consistent plot styling.
 color_red = '#DC4C46'
 color_blue = '#2F4A92'
 color_green = '#47785E'
@@ -23,6 +24,7 @@ sim_color = {
 }
 
 ### Data import
+	# Load RMSE curves versus communication probability.
 
 comm_prob = []
 ls_cen_rmse = []
@@ -58,6 +60,7 @@ with open('topology_result/rmte.txt') as rmte_file:
 		gs_ci_rmte.append(float(data_row[5]))
 
 ### Data visualization
+	# Build two-panel summary: RMSE (top) and RMTE (bottom).
 
 y_lim = [0, 0.18] 
 x_lim = [0, 1]
@@ -104,7 +107,6 @@ plt.ylim(y_lim_extra)
 plt.savefig('topology_result/topology.png')
 
 plt.show()
-
 
 
 

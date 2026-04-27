@@ -19,9 +19,10 @@ from topology import sample_topologies
 
 
 def default_epsilon_by_class(
-    epsilon_ugv: float = 0.10,
-    epsilon_uav: float = 0.05,
+    epsilon_ugv: float = 0.05,
+    epsilon_uav: float = 0.10,
 ) -> dict[AgentClass, float]:
+    # Class-conditioned nominal error rates used by downstream calibration logic.
     return {
         AgentClass.CLASS_A_UGV: float(epsilon_ugv),
         AgentClass.CLASS_B_UAV: float(epsilon_uav),
@@ -32,6 +33,7 @@ def default_class_quantiles(
     ugv_quantile: float = 1.0,
     uav_quantile: float = 1.0,
 ) -> dict[AgentClass, float]:
+    # Class-conditioned covariance inflation factors (default: neutral scaling).
     return {
         AgentClass.CLASS_A_UGV: float(ugv_quantile),
         AgentClass.CLASS_B_UAV: float(uav_quantile),
@@ -39,6 +41,7 @@ def default_class_quantiles(
 
 
 def alternating_agent_classes(num_agents: int) -> list[AgentClass]:
+    # Deterministic class assignment for mixed-team experiments.
     classes = [AgentClass.CLASS_A_UGV, AgentClass.CLASS_B_UAV]
     return [classes[idx % len(classes)] for idx in range(num_agents)]
 
@@ -47,6 +50,7 @@ def sample_initial_state(
     rng: np.random.Generator,
     jitter_std: float = 0.25,
 ) -> np.ndarray:
+    # Perturb the common initial stacked state to diversify episode starts.
     base_state = np.asarray(sim_env.initial_position, dtype=float).reshape(-1)
     jitter = rng.normal(0.0, jitter_std, size=base_state.shape)
     return base_state + jitter
@@ -57,6 +61,7 @@ def build_ground_truth_team(
     agent_classes: list[AgentClass],
     epsilon_by_class: dict[AgentClass, float] | None = None,
 ) -> list[Robot]:
+    # Instantiate truth robots with per-class epsilon settings.
     epsilon_by_class = epsilon_by_class or default_epsilon_by_class()
     robots = []
     for agent_id, agent_class in enumerate(agent_classes):
@@ -78,6 +83,7 @@ def build_local_filters(
     class_quantiles: dict[AgentClass | str, float] | None = None,
     ci_coeff: float = 0.8,
 ) -> list[GS_CI]:
+    # Instantiate one local GS-CI filter per robot.
     epsilon_by_class = epsilon_by_class or default_epsilon_by_class()
     initial_state_column = np.matrix(initial_state, dtype=float).reshape((-1, 1))
     return [
@@ -101,6 +107,7 @@ def sample_odometry_input(
 ) -> tuple[list[float], list[float]]:
     """Sample nominal and realized odometry inputs for one robot."""
 
+    # Re-sample until the realized control keeps the robot inside the arena.
     profile = robot.class_profile
     for _ in range(max_attempts):
         nominal_v = sim_env.max_v * profile.max_v_scale * rng.uniform(-1.0, 1.0)
@@ -129,6 +136,7 @@ def noisy_relative_measurement(
     bearing_var: float,
     rng: np.random.Generator,
 ) -> list[float]:
+    # Shared noisy range-bearing observation model used in simulation and calibration.
     target_position = np.asarray(target_position, dtype=float).reshape(-1)
     delta = target_position - np.asarray(observer_position, dtype=float).reshape(-1)
     distance = max(1.0e-6, float(np.linalg.norm(delta) + rng.normal(0.0, np.sqrt(range_var))))
@@ -137,6 +145,7 @@ def noisy_relative_measurement(
 
 
 def capture_team_state(robots: list[Robot]) -> np.ndarray:
+    # Flatten current team positions into the stacked 2N state convention.
     state = np.zeros(2 * len(robots), dtype=float)
     for robot_id, robot in enumerate(robots):
         ii = 2 * robot_id
@@ -145,6 +154,7 @@ def capture_team_state(robots: list[Robot]) -> np.ndarray:
 
 
 def _normalized_quantiles(class_quantiles: dict[AgentClass | str, float] | None) -> dict[AgentClass, float]:
+    # Accept enum or string keys and normalize for internal use.
     if class_quantiles is None:
         return default_class_quantiles()
     return {
@@ -163,6 +173,7 @@ def rollout_ground_truth_episode(
 ) -> tuple[list[Robot], list[dict[str, object]]]:
     """Generate a purely kinematic heterogeneous rollout for visualization."""
 
+    # Build a motion-only rollout for quick visualization/debugging.
     rng = np.random.default_rng(seed)
     dt = float(sim_env.dt if dt is None else dt)
     agent_classes = agent_classes or alternating_agent_classes(sim_env.N)
@@ -172,6 +183,7 @@ def rollout_ground_truth_episode(
     robots = build_ground_truth_team(initial_state, agent_classes, epsilon_by_class)
     frames: list[dict[str, object]] = []
 
+    # Per-step: sample controls, propagate truth, and record a frame.
     for step_id in range(num_steps):
         nominal_inputs = []
         realized_inputs = []
@@ -220,6 +232,7 @@ def simulate_class_conditional_gs_ci_rollout(
 ) -> dict[str, object]:
     """Run one heterogeneous GS-CI rollout and collect rendering diagnostics."""
 
+    # Full rollout with motion, observation, communication, and diagnostics.
     rng = np.random.default_rng(seed)
     dt = float(sim_env.dt if dt is None else dt)
     observ_prob = float(sim_env.observ_prob if observ_prob is None else observ_prob)
@@ -268,6 +281,7 @@ def simulate_class_conditional_gs_ci_rollout(
         dtype=float,
     )
 
+    # Optional formation controller adds target geometry and altitude profiles.
     controller_name = "random_odometry"
     formation_targets: list[dict[str, object]] = []
     static_obstacles: list[dict[str, object]] = []
@@ -285,12 +299,14 @@ def simulate_class_conditional_gs_ci_rollout(
             dtype=float,
         )
 
+    # Main simulation loop.
     for step_id in range(num_steps):
         for agent_id in range(sim_env.N):
             gs_ci_robots[agent_id].theta = truth_robots[agent_id].theta
 
         nominal_inputs = [None] * sim_env.N
         realized_inputs = [None] * sim_env.N
+        # Input generation: either random odometry or controller-driven motion.
         for agent_id, robot in enumerate(truth_robots):
             if controller is None:
                 nominal_inputs[agent_id], realized_inputs[agent_id] = sample_odometry_input(
@@ -323,10 +339,12 @@ def simulate_class_conditional_gs_ci_rollout(
                     dt=dt,
                 )
 
+        # Propagate truth and estimator priors.
         for agent_id in range(sim_env.N):
             truth_robots[agent_id].motion_propagation(realized_inputs[agent_id], dt)
             gs_ci_robots[agent_id].motion_propagation_update(nominal_inputs[agent_id], dt)
 
+        # Observation update for sampled graph edges.
         for observer_idx, observed_idx in observ_topology.edges:
             observer = truth_robots[observer_idx]
             local_filter = gs_ci_robots[observer_idx]
@@ -357,6 +375,7 @@ def simulate_class_conditional_gs_ci_rollout(
                 )
                 local_filter.rela_obsv_update(observed_idx, measurement)
 
+        # Communication update for sampled message-passing edges.
         for sender_idx, receiver_idx in comm_topology.edges:
             gs_ci_robots[receiver_idx].comm_update(
                 gs_ci_robots[sender_idx].s,
@@ -366,6 +385,7 @@ def simulate_class_conditional_gs_ci_rollout(
                 class_quantiles=class_quantiles,
             )
 
+        # Collect per-agent diagnostics for plotting/rendering.
         frame_poses = []
         for agent_id in range(sim_env.N):
             ii = 2 * agent_id
@@ -406,6 +426,7 @@ def simulate_class_conditional_gs_ci_rollout(
                 }
             )
 
+        # Camera focus follows robots (and formation targets in formation mode).
         if controller is not None:
             focus_points_xy = np.vstack((truth_positions[:, step_id, :], target_positions_xyz[:, :2]))
         else:
@@ -420,6 +441,7 @@ def simulate_class_conditional_gs_ci_rollout(
             }
         )
 
+    # Return full rollout bundle consumed by render and plotting scripts.
     return {
         "frames": frames,
         "truth_robots": truth_robots,

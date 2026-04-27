@@ -31,22 +31,22 @@ class AgentClassProfile:
 
 DEFAULT_AGENT_CLASS_PROFILES: dict[AgentClass, AgentClassProfile] = {
     AgentClass.CLASS_A_UGV: AgentClassProfile(
-        label="Differential-drive UGV",
-        max_v_scale=1.0,
-        max_omega_scale=1.0,
-        process_var_scale=1.0,
+        label="Differential-drive UGV (slower, higher-fidelity sensing)",
+        max_v_scale=0.7,
+        max_omega_scale=0.8,
+        process_var_scale=0.9,
         unobserved_process_var_scale=1.0,
-        range_var_scale=1.0,
-        bearing_var_scale=1.0,
+        range_var_scale=0.55,
+        bearing_var_scale=0.50,
     ),
     AgentClass.CLASS_B_UAV: AgentClassProfile(
-        label="Aerial robot with sharper maneuvers",
-        max_v_scale=1.6,
-        max_omega_scale=1.8,
-        process_var_scale=1.8,
-        unobserved_process_var_scale=1.4,
-        range_var_scale=0.65,
-        bearing_var_scale=0.55,
+        label="Fixed-wing UAV (faster, lower-fidelity sensing)",
+        max_v_scale=2.4,
+        max_omega_scale=2.2,
+        process_var_scale=1.9,
+        unobserved_process_var_scale=1.5,
+        range_var_scale=1.45,
+        bearing_var_scale=1.60,
     ),
 }
 

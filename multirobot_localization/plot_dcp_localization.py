@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_MPLCONFIGDIR = Path(__file__).resolve().parent / "output" / ".mplconfig"
+# Ensure Matplotlib cache/config writes to a local writable directory.
 os.environ.setdefault("MPLCONFIGDIR", str(DEFAULT_MPLCONFIGDIR))
 
 import matplotlib
@@ -50,6 +51,7 @@ class DCPDiagnostics:
 
 
 def parse_args() -> argparse.Namespace:
+    # CLI for rollout + DCP optimization + figure export.
     script_dir = Path(__file__).resolve().parent
     output_dir = script_dir / "output"
 
@@ -115,11 +117,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_matplotlib(output_dir: Path) -> None:
+    # Create deterministic writable config directory for headless plotting.
     mplconfig_dir = output_dir / ".mplconfig"
     mplconfig_dir.mkdir(parents=True, exist_ok=True)
 
 
 def split_conformal_quantile(scores: np.ndarray, alpha: float) -> tuple[float, float]:
+    # Compute split-conformal quantile level and the effective tau used.
     scores = np.asarray(scores, dtype=float)
     if scores.ndim != 1 or scores.size == 0:
         raise ValueError("scores must be a non-empty 1D array")
@@ -133,6 +137,7 @@ def split_conformal_quantile(scores: np.ndarray, alpha: float) -> tuple[float, f
 
 
 def mahalanobis_radius(mean: np.ndarray, covariance: np.ndarray, truth: np.ndarray) -> float:
+    # Convert posterior error into a scalar nonconformity score.
     mean = np.asarray(mean, dtype=float).reshape(-1)
     truth = np.asarray(truth, dtype=float).reshape(-1)
     covariance = np.asarray(covariance, dtype=float)
@@ -148,6 +153,7 @@ def load_dcp_calibration_scores(
     dataset_path: Path,
     agent_classes: list[str],
 ) -> tuple[dict[int, np.ndarray], dict[AgentClass, float]]:
+    # Load class-partitioned offline samples and build per-agent score buffers.
     if not dataset_path.exists():
         raise FileNotFoundError(
             f"Calibration dataset not found at {dataset_path}. "
@@ -160,6 +166,7 @@ def load_dcp_calibration_scores(
     scores_by_class: dict[AgentClass, list[float]] = {}
     alpha_by_class: dict[AgentClass, float] = {}
 
+    # Score each sample with the corresponding local 2D block.
     for class_name, samples in dataset["samples_by_class"].items():
         agent_class = normalize_agent_class(class_name)
         scores_by_class.setdefault(agent_class, [])
@@ -180,6 +187,7 @@ def load_dcp_calibration_scores(
             scores_by_class[agent_class].append(score)
             alpha_by_class[agent_class] = float(sample["epsilon"])
 
+    # Fallback for sparse classes: borrow class pool if an agent has no direct samples.
     for agent_id, class_name in enumerate(agent_classes):
         agent_class = normalize_agent_class(class_name)
         if scores_by_agent[agent_id]:
@@ -196,6 +204,7 @@ def load_dcp_calibration_scores(
 
 
 def cycle_metropolis_weights(num_agents: int) -> np.ndarray:
+    # Build doubly-stochastic mixing matrix for a cycle communication graph.
     if num_agents <= 0:
         raise ValueError("num_agents must be positive")
     if num_agents == 1:
@@ -224,6 +233,7 @@ def run_distributed_classwise_dcp(
     num_steps: int,
     step_size: float,
 ) -> DCPDiagnostics:
+    # Distributed subgradient routine run independently per class partition.
     num_agents = len(agent_classes)
     quantile_history = np.zeros((num_agents, num_steps + 1), dtype=float)
     local_quantiles = np.zeros(num_agents, dtype=float)
@@ -231,6 +241,7 @@ def run_distributed_classwise_dcp(
     sample_counts = np.zeros(num_agents, dtype=int)
     centralized_class_quantiles: dict[str, float] = {}
 
+    # Initialize each agent from its local split-conformal quantile.
     for agent_id in range(num_agents):
         agent_class = normalize_agent_class(agent_classes[agent_id])
         local_scores = np.asarray(scores_by_agent[agent_id], dtype=float)
@@ -238,6 +249,7 @@ def run_distributed_classwise_dcp(
         quantile_history[agent_id, 0] = local_quantiles[agent_id]
         sample_counts[agent_id] = int(local_scores.size)
 
+    # Solve one class-specific DCP problem for each present class.
     unique_classes = [normalize_agent_class(agent_class) for agent_class in dict.fromkeys(agent_classes)]
     for agent_class in unique_classes:
         class_agent_ids = [
@@ -256,6 +268,7 @@ def run_distributed_classwise_dcp(
         mixing_weights = cycle_metropolis_weights(len(class_agent_ids))
 
         for step in range(1, num_steps + 1):
+            # Consensus + subgradient correction with 1/sqrt(k) step decay.
             mixed_estimate = mixing_weights @ current
             step_scale = float(step_size) / np.sqrt(step)
             gradients = np.array(
@@ -280,6 +293,7 @@ def run_distributed_classwise_dcp(
 
 
 def tangent_normals(points: np.ndarray) -> np.ndarray:
+    # Estimate per-point curve normals from finite-difference tangents.
     tangents = np.zeros_like(points)
     if points.shape[0] == 1:
         tangents[0] = np.array([1.0, 0.0])
@@ -301,6 +315,7 @@ def covariance_tube_radius(
     normals: np.ndarray,
     scale: float,
 ) -> np.ndarray:
+    # Project covariance along local normal direction to get tube half-width.
     variances = np.einsum("ti,tij,tj->t", normals, covariances, normals)
     variances = np.maximum(variances, 0.0)
     return float(scale) * np.sqrt(variances)
@@ -314,6 +329,7 @@ def draw_uncertainty_tube(
     color,
     alpha: float,
 ) -> None:
+    # Draw a closed polygon around the estimated trajectory centerline.
     normals = tangent_normals(estimated_positions)
     radius = covariance_tube_radius(covariances, normals, scale=scale)
     upper = estimated_positions + normals * radius[:, None]
@@ -328,6 +344,7 @@ def save_top_down_uncertainty_plot(
     output_path: Path,
     tube_alpha: float,
 ) -> None:
+    # Side-by-side figure: raw covariance tubes vs DCP-calibrated tubes.
     truth_positions = np.asarray(rollout["truth_positions"], dtype=float)
     estimated_positions = np.asarray(rollout["estimated_positions"], dtype=float)
     raw_covariances = np.asarray(rollout["raw_covariances"], dtype=float)
@@ -343,6 +360,7 @@ def save_top_down_uncertainty_plot(
     ]
 
     for ax, (title, scales) in zip(axes, subplot_specs):
+        # Draw one uncertainty tube + true/estimated trajectories per agent.
         for agent_id in range(num_agents):
             color = colors[agent_id]
             truth_xy = truth_positions[agent_id]
@@ -395,6 +413,7 @@ def save_dcp_quantile_history_plot(
     agent_classes: list[str],
     output_path: Path,
 ) -> None:
+    # Plot distributed per-agent quantile trajectories and centralized references.
     num_agents = len(agent_classes)
     colors = plt.get_cmap("tab10")(np.arange(num_agents) % 10)
     iterations = np.arange(dcp.quantile_history.shape[1], dtype=int)
@@ -435,6 +454,7 @@ def save_metrics(
     rollout: dict[str, object],
     dcp: DCPDiagnostics,
 ) -> None:
+    # Persist arrays needed for downstream analysis without rerunning rollouts.
     np.savez(
         output_path,
         time=np.asarray(rollout["time"], dtype=float),
@@ -452,6 +472,7 @@ def save_metrics(
 
 
 def run(args: argparse.Namespace) -> None:
+    # End-to-end pipeline: rollout -> calibration scores -> DCP -> plots/metrics.
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_matplotlib(output_dir)
@@ -498,6 +519,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # CLI entrypoint.
     args = parse_args()
     run(args)
 

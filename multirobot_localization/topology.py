@@ -1,3 +1,5 @@
+"""Topology primitives and sampling helpers for observation/communication graphs."""
+
 import numpy as np
 
 
@@ -23,12 +25,14 @@ def sample_topologies(node_num, observ_prob, comm_prob, rng=None):
 
 	rng = rng or np.random.default_rng()
 
+	# Observation graph: edges may target robots or the landmark index.
 	observ_topology = Topology(node_num)
 	for i in range(node_num):
 		for j in range(node_num + 1):
 			if (i != j) and (rng.random() < observ_prob):
 				observ_topology.add_edge(i, j)
 
+	# Communication graph: robot-to-robot message passing edges only.
 	comm_topology = Topology(node_num)
 	for i in range(node_num):
 		for j in range(node_num):
@@ -39,6 +43,7 @@ def sample_topologies(node_num, observ_prob, comm_prob, rng=None):
 
 
 def generate_topology(node_num, observ_prob, comm_prob):
+	"""Persist one sampled topology pair to topology/output.txt."""
 	observ_topology, comm_topology = sample_topologies(node_num, observ_prob, comm_prob)
 
 	with open('topology/output.txt', 'w') as output_file:

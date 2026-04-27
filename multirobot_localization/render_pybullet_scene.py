@@ -48,6 +48,7 @@ VISUAL_SPECS: dict[AgentClass, VehicleVisualSpec] = {
 
 
 def parse_args() -> argparse.Namespace:
+    # CLI for rendering rollout playback plus diagnostic exports.
     script_dir = Path(__file__).resolve().parent
     output_dir = script_dir / "output"
     mesh_dir = script_dir / "assets" / "meshes"
@@ -217,6 +218,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def import_pybullet():
+    # Lazy import keeps this module importable without PyBullet installed.
     try:
         import pybullet as pybullet
     except ImportError as exc:
@@ -227,6 +229,7 @@ def import_pybullet():
 
 
 def import_imageio():
+    # Video writer dependencies are only required when MP4 export is enabled.
     try:
         import imageio.v2 as imageio
         import imageio_ffmpeg  # noqa: F401
@@ -238,11 +241,13 @@ def import_imageio():
 
 
 def connection_is_alive(pybullet, client_id: int) -> bool:
+    # Defensive connection check for cleanup/GUI hold loops.
     info = pybullet.getConnectionInfo(physicsClientId=client_id)
     return bool(info.get("isConnected", 0))
 
 
 def resolve_mesh_paths(args: argparse.Namespace) -> dict[AgentClass, Path]:
+    # Map class to mesh filename from CLI options.
     return {
         AgentClass.CLASS_A_UGV: args.mesh_dir / args.ugv_mesh,
         AgentClass.CLASS_B_UAV: args.mesh_dir / args.uav_mesh,
@@ -250,23 +255,27 @@ def resolve_mesh_paths(args: argparse.Namespace) -> dict[AgentClass, Path]:
 
 
 def mesh_scale_for(agent_class: AgentClass, args: argparse.Namespace) -> list[float]:
+    # Uniform scale factor per class.
     scale = args.ugv_scale if agent_class == AgentClass.CLASS_A_UGV else args.uav_scale
     return [float(scale), float(scale), float(scale)]
 
 
 def body_z_for(agent_class: AgentClass, args: argparse.Namespace) -> float:
+    # Default world z-offset per class body origin.
     if agent_class == AgentClass.CLASS_A_UGV:
         return float(args.ugv_z)
     return float(args.uav_altitude)
 
 
 def pose_z_for(pose: dict[str, object], args: argparse.Namespace) -> float:
+    # Frame-level render altitude overrides class default if provided.
     if "render_z" in pose:
         return float(pose["render_z"])
     return body_z_for(normalize_agent_class(pose["agent_class"]), args)
 
 
 def create_ground(pybullet, client_id: int):
+    # Create a static floor plane represented as a thin box.
     collision = pybullet.createCollisionShape(
         pybullet.GEOM_BOX,
         halfExtents=[40.0, 40.0, 0.05],
@@ -288,6 +297,7 @@ def create_ground(pybullet, client_id: int):
 
 
 def create_target_marker(pybullet, client_id: int, target: dict[str, object], agent_class: AgentClass) -> int:
+    # Render translucent target slots used in formation mode.
     x, y, z = [float(value) for value in target["position_xyz"]]
     color = list(VISUAL_SPECS[agent_class].color_rgba[:3]) + [0.30]
     visual = pybullet.createVisualShape(
@@ -307,6 +317,7 @@ def create_target_marker(pybullet, client_id: int, target: dict[str, object], ag
 
 
 def create_static_obstacle_body(pybullet, client_id: int, obstacle: dict[str, object]) -> int:
+    # Build static scene obstacles from serialized obstacle dictionaries.
     primitive = str(obstacle["primitive"])
     x, y, z = [float(value) for value in obstacle["position_xyz"]]
     color = list(obstacle["color_rgba"])
@@ -355,6 +366,7 @@ def create_static_obstacle_body(pybullet, client_id: int, obstacle: dict[str, ob
 
 
 def create_visual_shape(pybullet, client_id: int, agent_class: AgentClass, mesh_path: Path, args: argparse.Namespace) -> int:
+    # Prefer mesh assets when available; fall back to class primitives otherwise.
     spec = VISUAL_SPECS[agent_class]
     if mesh_path.exists() and not args.use_primitives_only:
         return pybullet.createVisualShape(
@@ -386,6 +398,7 @@ def create_visual_shape(pybullet, client_id: int, agent_class: AgentClass, mesh_
 
 
 def create_collision_shape(pybullet, client_id: int, agent_class: AgentClass) -> int:
+    # Keep collision geometry simple/stable across mesh variants.
     spec = VISUAL_SPECS[agent_class]
     return pybullet.createCollisionShape(
         pybullet.GEOM_BOX,
@@ -395,6 +408,7 @@ def create_collision_shape(pybullet, client_id: int, agent_class: AgentClass) ->
 
 
 def create_vehicle_body(pybullet, client_id: int, agent_id: int, agent_class: AgentClass, mesh_path: Path, args: argparse.Namespace) -> int:
+    # Construct one kinematic body that will be pose-reset every frame.
     visual = create_visual_shape(pybullet, client_id, agent_class, mesh_path, args)
     collision = create_collision_shape(pybullet, client_id, agent_class)
     z = body_z_for(agent_class, args)
@@ -420,6 +434,7 @@ def create_vehicle_body(pybullet, client_id: int, agent_id: int, agent_class: Ag
 
 
 def update_vehicle_pose(pybullet, client_id: int, body_id: int, pose: dict[str, object], args: argparse.Namespace):
+    # Apply rollout pose directly to the render body.
     x, y = pose["position_xy"]
     yaw = float(pose["theta"])
     z = pose_z_for(pose, args)
@@ -439,6 +454,7 @@ def update_vehicle_pose(pybullet, client_id: int, body_id: int, pose: dict[str, 
 
 
 def update_agent_labels(pybullet, client_id: int, label_ids: dict[int, int], pose: dict[str, object], args: argparse.Namespace):
+    # Maintain one replaceable debug text handle per agent.
     if not args.show_labels:
         return
 
@@ -468,6 +484,7 @@ def update_trails(
     pose: dict[str, object],
     args: argparse.Namespace,
 ):
+    # Draw a finite history trail by appending/removing debug lines.
     if not args.show_trails:
         return
 
@@ -495,6 +512,7 @@ def update_trails(
 
 
 def frame_camera_target(frame: dict[str, object], args: argparse.Namespace) -> list[float]:
+    # Camera tracks team centroid (or explicit focus) with altitude-aware offset.
     if "camera_focus_xy" in frame:
         focus_xy = np.asarray(frame["camera_focus_xy"], dtype=float).reshape(2)
     else:
@@ -506,6 +524,7 @@ def frame_camera_target(frame: dict[str, object], args: argparse.Namespace) -> l
 
 
 def reset_camera(pybullet, frame: dict[str, object], args: argparse.Namespace):
+    # Update GUI camera each frame in interactive mode.
     pybullet.resetDebugVisualizerCamera(
         cameraDistance=float(args.camera_distance),
         cameraYaw=float(args.camera_yaw),
@@ -515,6 +534,7 @@ def reset_camera(pybullet, frame: dict[str, object], args: argparse.Namespace):
 
 
 def capture_frame(pybullet, client_id: int, frame: dict[str, object], args: argparse.Namespace) -> np.ndarray:
+    # Render RGB frame via TinyRenderer for deterministic offscreen capture.
     view_matrix = pybullet.computeViewMatrixFromYawPitchRoll(
         cameraTargetPosition=frame_camera_target(frame, args),
         distance=float(args.camera_distance),
@@ -542,6 +562,7 @@ def capture_frame(pybullet, client_id: int, frame: dict[str, object], args: argp
 
 
 def color_for_class(agent_class: AgentClass) -> tuple[float, float, float]:
+    # Shared color lookup used by diagnostics plots.
     return VISUAL_SPECS[agent_class].color_rgba[:3]
 
 
@@ -551,6 +572,7 @@ def save_per_agent_position_error_plot(
     agent_classes: list[str],
     output_path: Path,
 ):
+    # Plot position error time-series with one subplot per agent.
     mplconfig_dir = output_path.parent / ".mplconfig"
     mplconfig_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(mplconfig_dir))
@@ -586,6 +608,7 @@ def save_per_agent_covariance_plot(
     agent_classes: list[str],
     output_path: Path,
 ):
+    # Plot raw vs calibrated covariance trace for each agent.
     mplconfig_dir = output_path.parent / ".mplconfig"
     mplconfig_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(mplconfig_dir))
@@ -617,6 +640,7 @@ def save_per_agent_covariance_plot(
 
 
 def save_metadata(output_path: Path, rollout: dict[str, object], args: argparse.Namespace):
+    # Export compact run configuration + topology metadata as JSON.
     metadata = {
         "steps": int(args.steps),
         "dt": float(args.dt),
@@ -642,6 +666,7 @@ def save_metadata(output_path: Path, rollout: dict[str, object], args: argparse.
 
 
 def save_metrics(output_path: Path, rollout: dict[str, object]):
+    # Export numeric diagnostics arrays for later analysis.
     np.savez(
         output_path,
         time=np.asarray(rollout["time"], dtype=float),
@@ -656,6 +681,7 @@ def save_metrics(output_path: Path, rollout: dict[str, object]):
 
 
 def build_rollout(args: argparse.Namespace) -> dict[str, object]:
+    # Run simulator once and validate there is at least one frame to render.
     quantiles = default_class_quantiles(
         ugv_quantile=args.ugv_quantile,
         uav_quantile=args.uav_quantile,
@@ -677,6 +703,7 @@ def build_rollout(args: argparse.Namespace) -> dict[str, object]:
 
 
 def ensure_valid_mode(args: argparse.Namespace):
+    # Prevent GUI-only options in headless mode.
     if args.loop and args.headless:
         raise ValueError("`--loop` is only supported in GUI mode.")
     if args.hold_on_complete and args.headless:
@@ -684,6 +711,7 @@ def ensure_valid_mode(args: argparse.Namespace):
 
 
 def run(args: argparse.Namespace):
+    # Main rendering pipeline: rollout -> pybullet playback -> video/plots/metadata.
     ensure_valid_mode(args)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -702,6 +730,7 @@ def run(args: argparse.Namespace):
     writer = None
 
     try:
+        # Scene setup and static geometry creation.
         pybullet.resetSimulation(physicsClientId=client_id)
         pybullet.setGravity(0.0, 0.0, -9.81, physicsClientId=client_id)
         pybullet.setTimeStep(float(args.dt), physicsClientId=client_id)
@@ -754,6 +783,7 @@ def run(args: argparse.Namespace):
         playback_delay = max(float(args.dt) / max(float(args.playback_speed), 1.0e-6), 0.0)
         _ = obstacle_body_ids, target_marker_ids
 
+        # Playback loop (optionally repeated in GUI mode when --loop is set).
         while True:
             for frame in frames:
                 if not args.headless:
@@ -770,6 +800,7 @@ def run(args: argparse.Namespace):
                         physicsClientId=client_id,
                     )
 
+                # Pose application and optional overlays.
                 for pose in frame["poses"]:
                     agent_id = int(pose["agent_id"])
                     update_vehicle_pose(pybullet, client_id, body_ids[agent_id], pose, args)
@@ -787,6 +818,7 @@ def run(args: argparse.Namespace):
             if not args.loop:
                 break
 
+        # Optional post-playback hold for manual inspection in GUI mode.
         if args.hold_on_complete and not args.headless:
             while connection_is_alive(pybullet, client_id):
                 pybullet.stepSimulation(physicsClientId=client_id)
@@ -797,6 +829,7 @@ def run(args: argparse.Namespace):
         if connection_is_alive(pybullet, client_id):
             pybullet.disconnect(client_id)
 
+    # Save diagnostics plots unless explicitly disabled.
     if not args.skip_plots:
         save_per_agent_position_error_plot(
             time_axis=np.asarray(rollout["time"], dtype=float),
@@ -817,6 +850,7 @@ def run(args: argparse.Namespace):
 
 
 def main():
+    # CLI entrypoint.
     args = parse_args()
     run(args)
 

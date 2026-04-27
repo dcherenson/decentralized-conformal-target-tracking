@@ -1,3 +1,5 @@
+"""Run boundedness experiments and export time-series RMSE/RMTE metrics."""
+
 import sys
 sys.path.append("algorithm/")
 
@@ -17,6 +19,7 @@ from ls_bda import LS_BDA
 from ls_sci import LS_SCI
 
 
+# Global experiment settings.
 num_of_trial = sim_env.num_of_trial
 total_T = sim_env.total_T
 
@@ -27,6 +30,7 @@ M = sim_env.M     # number of landmark
 dt = sim_env.dt
 
 ### Network Topology
+# Load the fixed default topology used for boundedness plots.
 topo_file = open('topology/default.txt', 'r')
 
 observ_topology = Topology(sim_env.N)
@@ -51,6 +55,7 @@ topo_file.close()
 
 
 
+# Time-series accumulators averaged over Monte Carlo trials.
 gs_ci_rmse_arr = [0] * total_T
 gs_ci_rmte_arr = [0] * total_T
 
@@ -77,7 +82,7 @@ for iter_of_trial in range(num_of_trial):
 
 	initial = sim_env.initial_position
 
-	# initialization
+	# Initialize truth robots plus all estimator variants.
 	robots = [None] * N
 
 	gs_ci_robots = [None] * N
@@ -96,7 +101,7 @@ for iter_of_trial in range(num_of_trial):
 	for m in range(M):
 		landmarks[m] = sim_env.Landmark(m, np.matrix(sim_env.landmark_position, dtype=float).getT())
 
-	# simulation body
+	# Simulation body: predict, observe, communicate, evaluate.
 	for t in range(total_T):
  
 		# reset theta
@@ -109,7 +114,7 @@ for iter_of_trial in range(num_of_trial):
 			ls_bda_team.theta[n] = robots[n].theta
 
 
-		# motion propagation 
+		# motion propagation
 		odometry_input = [0] * N
 		odometry_star_input = [0] * N
 
@@ -166,7 +171,7 @@ for iter_of_trial in range(num_of_trial):
 				ls_bda_team.rela_obsv_update(observer_idx, observed_idx, [dis, phi])				
 
 		
-		# communication update
+		# communication update (distributed methods only).
 		for edge in comm_topology.edges:
 			[sender_idx, receiver_idx] = edge
 
@@ -233,6 +238,7 @@ for iter_of_trial in range(num_of_trial):
 
 
 # output
+# Write averaged traces for later plotting.
 gs_ci_file = open('boundedness_result/gs_ci_output.txt', 'w')
 gs_ci_1_file = open('boundedness_result/gs_ci_1_output.txt', 'w')
 

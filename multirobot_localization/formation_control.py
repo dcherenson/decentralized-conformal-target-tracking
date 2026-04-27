@@ -127,6 +127,7 @@ def default_formation_targets(
 ) -> list[FormationTarget3D]:
     """Build a default 3D stacked formation for the current team composition."""
 
+    # Partition agents by class so ground and air slots are generated separately.
     cx, cy = (float(center_xy[0]), float(center_xy[1]))
     normalized_classes = [normalize_agent_class(agent_class) for agent_class in agent_classes]
     ugv_ids = [agent_id for agent_id, agent_class in enumerate(normalized_classes) if agent_class == AgentClass.CLASS_A_UGV]
@@ -135,6 +136,7 @@ def default_formation_targets(
     targets: dict[int, FormationTarget3D] = {}
 
     if ugv_ids:
+        # Ground robots are arranged on an outer ring at ground-level altitude.
         angles = np.linspace(0.0, 2.0 * np.pi, len(ugv_ids), endpoint=False) + (0.5 * np.pi)
         for slot_id, (agent_id, angle) in enumerate(zip(ugv_ids, angles, strict=False)):
             position_xyz = (
@@ -149,6 +151,7 @@ def default_formation_targets(
             )
 
     if uav_ids:
+        # UAVs occupy a tighter ring with stacked altitude offsets.
         if len(uav_ids) == 1:
             air_angles = np.asarray([0.5 * np.pi], dtype=float)
         else:
@@ -208,6 +211,7 @@ class EstimateDrivenFormationController:
         gains: FormationControlGains | None = None,
         safety_filter: SafetyFilter | None = None,
     ):
+        # Store immutable geometry + tuneable gains/filter hook for controller calls.
         if not formation_targets:
             raise ValueError("formation_targets must be non-empty")
 
@@ -222,6 +226,7 @@ class EstimateDrivenFormationController:
         self.name = "estimate_driven_formation_controller"
 
     def target_position_xyz(self, agent_id: int) -> np.ndarray:
+        # Return a defensive copy so callers do not mutate controller targets.
         return self.targets[int(agent_id)].copy()
 
     def update_render_altitude(
@@ -230,6 +235,7 @@ class EstimateDrivenFormationController:
         current_altitude: float,
         dt: float,
     ) -> float:
+        # First-order altitude tracker for rendering-only z transitions.
         target_altitude = float(self.target_position_xyz(agent_id)[2])
         delta = target_altitude - float(current_altitude)
         max_step = self.gains.vertical_rate_limit * float(dt)
@@ -244,12 +250,14 @@ class EstimateDrivenFormationController:
         robot: Robot,
         dt: float,
     ) -> list[float]:
+        # Compute planar control command from estimated pose to assigned target slot.
         estimated_position_xy = np.asarray(estimated_position_xy, dtype=float).reshape(2)
         target_position_xyz = self.target_position_xyz(agent_id)
         delta_xy = target_position_xyz[:2] - estimated_position_xy
         distance = float(np.linalg.norm(delta_xy))
 
         if distance <= self.gains.position_tolerance:
+            # Stop when the estimate is sufficiently close to the target.
             nominal_input = np.zeros(2, dtype=float)
         else:
             heading = atan2(delta_xy[1], delta_xy[0])
@@ -257,6 +265,7 @@ class EstimateDrivenFormationController:
             max_speed = sim_env.max_v * robot.class_profile.max_v_scale
             max_turn_rate = sim_env.max_omega * robot.class_profile.max_omega_scale
 
+            # Slow linear speed when heading error is large to reduce overshoot.
             heading_alignment = max(0.0, np.cos(heading_error))
             heading_scale = heading_alignment ** self.gains.heading_slowdown_power
             linear_velocity = min(self.gains.linear_gain * distance, max_speed) * heading_scale
@@ -267,6 +276,7 @@ class EstimateDrivenFormationController:
             )
             nominal_input = np.array([linear_velocity, angular_velocity], dtype=float)
 
+        # Optional external filter can enforce obstacle/safety constraints.
         filtered_input = self.safety_filter.filter_control(
             agent_id=agent_id,
             nominal_input=nominal_input,
@@ -287,6 +297,7 @@ class EstimateDrivenFormationController:
         dt: float,
         rng: np.random.Generator,
     ) -> list[float]:
+        # Sample realized control by adding process noise to nominal commands.
         nominal_velocity, nominal_omega = nominal_input
         velocity_noise = rng.normal(
             0.0,
@@ -307,5 +318,6 @@ class EstimateDrivenFormationController:
             dtype=float,
         )
         if not sim_env.inRange(proposal, sim_env.origin):
+            # Freeze linear motion if the proposal exits the simulation bounds.
             return [0.0, float(realized_omega)]
         return [realized_velocity, realized_omega]

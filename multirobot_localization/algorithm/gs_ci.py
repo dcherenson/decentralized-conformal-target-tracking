@@ -1,3 +1,5 @@
+"""GS-CI local filter with class-conditional process/sensor scaling."""
+
 from math import cos, sin
 
 import numpy as np
@@ -32,6 +34,7 @@ class GS_CI:
 		self.ci_coeff = float(ci_coeff)
 		self.class_profile = class_profile or DEFAULT_AGENT_CLASS_PROFILES[self.agent_class]
 
+		# Class profile values scale motion and measurement uncertainty.
 		self.var_u_v = sim_env.var_u_v * self.class_profile.process_var_scale
 		self.var_v = sim_env.var_v * self.class_profile.unobserved_process_var_scale
 		self.var_dis = sim_env.var_dis * self.class_profile.range_var_scale
@@ -85,7 +88,7 @@ class GS_CI:
 		self.s[ii, 0] = self.s[ii, 0] + cos(self.theta) * v * dt
 		self.s[ii + 1, 0] = self.s[ii + 1, 0] + sin(self.theta) * v * dt
 
-		# covariance update
+		# Covariance propagation updates self and non-self blocks differently.
 		for j in range(sim_env.N):
 			jj = 2 * j
 
@@ -113,6 +116,7 @@ class GS_CI:
 		hat_z = sim_env.rot_mtx(self.theta).getT() * (landmark.position + H_i * self.s)
 		z = matrix([dis * cos(phi), dis * sin(phi)]).getT()
 
+		# Absolute landmark update in Cartesianized measurement space.
 		sigma_z = sim_env.rot_mtx(phi) * matrix([[self.var_dis, 0], [0, (dis ** 2) * self.var_phi]]) * sim_env.rot_mtx(phi).getT()
 		sigma_invention = H * self.sigma * H.getT() + sigma_z
 		kalman_gain = self.sigma * H.getT() * sigma_invention.getI()
@@ -141,6 +145,7 @@ class GS_CI:
 		hat_z = H * self.s
 		z = matrix([dis * cos(phi), dis * sin(phi)]).getT()
 
+		# Relative inter-robot update.
 		sigma_z = sim_env.rot_mtx(phi) * matrix([[self.var_dis, 0], [0, (dis ** 2) * self.var_phi]]) * sim_env.rot_mtx(phi).getT()
 		sigma_invention = H * self.sigma * H.getT() + sigma_z
 		kalman_gain = self.sigma * H.getT() * sigma_invention.getI()

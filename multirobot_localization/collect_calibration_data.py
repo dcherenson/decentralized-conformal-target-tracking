@@ -25,6 +25,7 @@ from heterogeneous_scenario import (
 
 
 def parse_args() -> argparse.Namespace:
+    # CLI for generating synthetic calibration samples under class-conditioned dynamics.
     parser = argparse.ArgumentParser(
         description=(
             "Collect an exchangeable offline calibration dataset for "
@@ -82,13 +83,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epsilon-ugv",
         type=float,
-        default=0.10,
+        default=0.05,
         help="Target error rate logged for CLASS_A_UGV agents.",
     )
     parser.add_argument(
         "--epsilon-uav",
         type=float,
-        default=0.05,
+        default=0.10,
         help="Target error rate logged for CLASS_B_UAV agents.",
     )
     return parser.parse_args()
@@ -99,6 +100,7 @@ def build_local_filters(
     agent_classes: list[AgentClass],
     epsilon_by_class: dict[AgentClass, float],
 ) -> list[GS_CI]:
+    # Build one local GS-CI estimator per robot from the same initial stacked state.
     initial_state_column = np.matrix(initial_state, dtype=float).reshape((-1, 1))
     return [
         GS_CI(
@@ -112,10 +114,12 @@ def build_local_filters(
 
 
 def flatten_state(state) -> list[float]:
+    # Normalize matrix/array state to a flat JSON-serializable list.
     return np.asarray(state, dtype=float).reshape(-1).tolist()
 
 
 def flatten_covariance(covariance) -> list[list[float]]:
+    # Normalize covariance to nested Python lists for serialization.
     return np.asarray(covariance, dtype=float).tolist()
 
 
@@ -127,6 +131,7 @@ def noisy_relative_measurement(
     bearing_var: float,
     rng: np.random.Generator,
 ) -> list[float]:
+    # Generate noisy range-bearing observations from observer frame.
     target_position = np.asarray(target_position, dtype=float).reshape(-1)
     delta = target_position - np.asarray(observer_position, dtype=float).reshape(-1)
     distance = max(1.0e-6, float(linalg.norm(delta) + rng.normal(0.0, np.sqrt(range_var))))
@@ -144,6 +149,7 @@ def log_snapshot(
     truth_state: np.ndarray,
     local_filter: GS_CI,
 ):
+    # Record one exchangeable posterior snapshot for offline conformal calibration.
     dataset_by_class[agent_class.value].append(
         {
             "episode_id": int(episode_id),
@@ -159,6 +165,7 @@ def log_snapshot(
 
 
 def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
+    # Global setup shared across episodes.
     rng = np.random.default_rng(args.seed)
     epsilon_by_class = default_epsilon_by_class(
         epsilon_ugv=args.epsilon_ugv,
@@ -179,6 +186,7 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
 
     min_snapshot_step = min(max(args.burn_in, 0), args.steps - 1)
 
+    # Each episode contributes one sampled snapshot per agent after burn-in.
     for episode_id in range(args.episodes):
         episode_rng = np.random.default_rng(rng.integers(0, 2**32 - 1))
         initial_state = sample_initial_state(episode_rng, args.initial_jitter_std)
@@ -191,12 +199,14 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
         }
         pending_snapshots = set(snapshot_steps.keys())
 
+        # Simulation loop: synchronize heading, propagate, observe, and log snapshots.
         for step_id in range(args.steps):
             for agent_id in range(sim_env.N):
                 local_filters[agent_id].theta = truth_robots[agent_id].theta
 
             nominal_inputs = [None] * sim_env.N
             realized_inputs = [None] * sim_env.N
+            # Sample noisy controls and evolve truth + filter predictions.
             for agent_id, robot in enumerate(truth_robots):
                 nominal_inputs[agent_id], realized_inputs[agent_id] = sample_odometry_input(
                     robot=robot,
@@ -208,6 +218,7 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
                 truth_robots[agent_id].motion_propagation(realized_inputs[agent_id], sim_env.dt)
                 local_filters[agent_id].motion_propagation_update(nominal_inputs[agent_id], sim_env.dt)
 
+            # Apply stochastic landmark and relative observations.
             for observer_id, observer in enumerate(truth_robots):
                 local_filter = local_filters[observer_id]
 
@@ -242,6 +253,7 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
                     )
                     local_filter.rela_obsv_update(target_id, measurement)
 
+            # Log only agents whose pre-sampled snapshot time matches this step.
             truth_state = capture_team_state(truth_robots)
             sampled_agents = [
                 agent_id for agent_id in pending_snapshots if snapshot_steps[agent_id] == step_id
@@ -260,6 +272,7 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
                 )
                 pending_snapshots.remove(agent_id)
 
+    # Dataset payload keeps metadata and class-partitioned samples.
     return {
         "metadata": {
             "format": "class_conditional_calibration_dataset/v1",
@@ -287,6 +300,7 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _empty_sample_arrays(state_dim: int) -> dict[str, np.ndarray]:
+    # Allocate empty typed arrays for classes without any samples.
     return {
         "episode_id": np.zeros((0,), dtype=np.int64),
         "time_index": np.zeros((0,), dtype=np.int64),
@@ -302,6 +316,7 @@ def _samples_to_numpy_arrays(
     samples: list[dict[str, object]],
     state_dim: int,
 ) -> dict[str, np.ndarray]:
+    # Convert per-snapshot dictionaries into compact vectorized arrays.
     if not samples:
         return _empty_sample_arrays(state_dim)
 
@@ -326,6 +341,7 @@ def _samples_to_numpy_arrays(
 
 
 def save_calibration_dataset(path: Path, dataset: dict[str, object]) -> None:
+    # Write dataset in one of the supported interchange/storage formats.
     suffix = path.suffix.lower()
 
     if suffix == ".json":
@@ -339,6 +355,7 @@ def save_calibration_dataset(path: Path, dataset: dict[str, object]) -> None:
         return
 
     if suffix == ".npz":
+        # NPZ path packs metadata as JSON text plus per-class array fields.
         metadata = dict(dataset["metadata"])
         state_dim = 2 * int(metadata["num_agents"])
         arrays: dict[str, np.ndarray] = {
@@ -365,6 +382,7 @@ def save_calibration_dataset(path: Path, dataset: dict[str, object]) -> None:
 
 
 def load_calibration_dataset(path: Path) -> dict[str, object]:
+    # Read dataset from JSON/Pickle/NPZ into the canonical dict structure.
     suffix = path.suffix.lower()
 
     if suffix == ".json":
@@ -376,6 +394,7 @@ def load_calibration_dataset(path: Path) -> dict[str, object]:
             return pickle.load(handle)
 
     if suffix == ".npz":
+        # Rebuild list-of-dicts samples from array-backed NPZ storage.
         with np.load(path) as archive:
             metadata = json.loads(str(archive["metadata_json"]))
             state_dim = 2 * int(metadata["num_agents"])
@@ -419,6 +438,7 @@ def load_calibration_dataset(path: Path) -> dict[str, object]:
 
 
 def main():
+    # End-to-end entrypoint used from command line.
     args = parse_args()
     dataset = collect_dataset(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)

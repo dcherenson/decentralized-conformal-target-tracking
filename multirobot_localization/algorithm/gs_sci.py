@@ -1,3 +1,5 @@
+"""Legacy GS-SCI variant with split independent/dependent covariance terms."""
+
 from numpy import matrix
 from math import cos, sin, atan2, sqrt
 
@@ -9,6 +11,7 @@ i_mtx_10 = sim_env.i_mtx_10
 class GS_SCI():
 
 	def __init__(self, _index, _initial_s, _theta=0.0):
+		# Keep an index-local state view plus split covariance representation.
 		self.index = _index
 
 		self.s = _initial_s.copy()
@@ -32,7 +35,7 @@ class GS_SCI():
 		self.s[ii+1,0] = self.s[ii+1,0] + sin(self.theta)*v*dt
 
 
-		# covariance update
+		# Propagate only the independent component during motion.
 		for j in range(sim_env.N):
 			jj = 2*j
 
@@ -46,6 +49,7 @@ class GS_SCI():
 
 	def ablt_obsv_update(self, obs_value, landmark):
 		ii = 2*self.index
+		# Total covariance drives the Kalman update; posterior is re-split.
 		total_sigma = self.sigma_i + self.sigma_d
 
 		H_i = matrix([[0,0,0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0,0,0]], dtype=float)
@@ -74,6 +78,7 @@ class GS_SCI():
 	def rela_obsv_update(self, obs_idx, obs_value):
 		ii = 2*self.index
 		jj = 2*obs_idx
+		# Relative update mirrors the absolute split-covariance logic.
 		total_sigma = self.sigma_i + self.sigma_d
 
 
@@ -102,7 +107,7 @@ class GS_SCI():
 		self.sigma_d = total_sigma - self.sigma_i
 
 
-	# the original algorithm in the paper
+	# Baseline variant from the original GS-SCI derivation.
 	def rela_obsv_original(self, obs_idx, obs_value):
 		ii = 2*self.index
 		jj = 2*obs_idx
@@ -137,6 +142,7 @@ class GS_SCI():
 
 
 	def comm_update(self, comm_robot_s, comm_robot_sigma_i, comm_robot_sigma_d):
+		# Fuse independent/dependent parts through SCI information blending.
 
 		sci_coeff =  0.8
 
@@ -153,7 +159,7 @@ class GS_SCI():
 
 
 	def getSigma(self):
+		# Convenience accessor used by plotting/evaluation scripts.
 		return self.sigma_i.copy() + self.sigma_d.copy()
-
 
 

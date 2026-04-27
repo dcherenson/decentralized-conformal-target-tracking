@@ -1,3 +1,5 @@
+"""LS-BDA variant with block-diagonal approximation for relative updates."""
+
 from numpy import matrix
 from math import cos, sin, atan2, sqrt
 
@@ -11,6 +13,7 @@ class LS_BDA(LS_Cen):
 
 	def ablt_obsv_update(self, idx, obs_value, landmark):
 		ii = 2*idx
+		# Localize update to the observer block and cross-block couplings.
 
 		local_s = self.s[ii:ii+2].copy()
 		local_sigma = self.sigma[ii:ii+2,ii:ii+2]
@@ -43,6 +46,7 @@ class LS_BDA(LS_Cen):
 	def rela_obsv_update(self, idx, obs_idx, obs_value):
 		ii = 2*idx
 		jj = 2*obs_idx
+		# Build a reduced covariance over the interacting robot pair.
 
 
 		H_ij = matrix([[0,0,0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0,0,0]], dtype=float)
@@ -78,6 +82,7 @@ class LS_BDA(LS_Cen):
 		self.s[ii:ii+2] = self.s[ii:ii+2] + kalman_gain[ii:ii+2] * (z-hat_z)
 		self.s[jj:jj+2] = self.s[jj:jj+2] + kalman_gain[jj:jj+2] * (z-hat_z)
 
+		# Apply reduced update globally, then recondition cross-covariances.
 		self.sigma = self.sigma - kalman_gain*H*reduced_sigma
 
 
@@ -94,4 +99,3 @@ class LS_BDA(LS_Cen):
 
 					self.sigma[kk:kk+2,ii:ii+2] =  self.sigma[kk:kk+2,ii:ii+2] * multi_i.getT()
 					self.sigma[kk:kk+2,jj:jj+2] =  self.sigma[kk:kk+2,jj:jj+2] * multi_j.getT()
-
