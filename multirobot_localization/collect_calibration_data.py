@@ -15,6 +15,10 @@ import sim_env
 from agent_classes import DEFAULT_AGENT_CLASS_PROFILES, AgentClass
 from algorithm.gs_ci import GS_CI
 from heterogeneous_scenario import (
+    BEARING_OUTLIER_PROB,
+    BEARING_OUTLIER_SCALE,
+    RANGE_OUTLIER_PROB,
+    RANGE_OUTLIER_SCALE,
     alternating_agent_classes,
     build_ground_truth_team,
     capture_team_state,
@@ -83,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epsilon-ugv",
         type=float,
-        default=0.05,
+        default=0.10,
         help="Target error rate logged for CLASS_A_UGV agents.",
     )
     parser.add_argument(
@@ -91,6 +95,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.10,
         help="Target error rate logged for CLASS_B_UAV agents.",
+    )
+    parser.add_argument(
+        "--score-histogram-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional output path for score histogram figure. "
+            "Defaults to <output_stem>_score_histogram.png next to --output."
+        ),
     )
     return parser.parse_args()
 
@@ -123,6 +136,19 @@ def flatten_covariance(covariance) -> list[list[float]]:
     return np.asarray(covariance, dtype=float).tolist()
 
 
+def mahalanobis_radius(mean: np.ndarray, covariance: np.ndarray, truth: np.ndarray) -> float:
+    # Nonconformity score used by CP: Mahalanobis radius in the local 2D agent state.
+    mean = np.asarray(mean, dtype=float).reshape(-1)
+    truth = np.asarray(truth, dtype=float).reshape(-1)
+    covariance = np.asarray(covariance, dtype=float)
+    covariance = 0.5 * (covariance + covariance.T)
+    covariance += 1.0e-12 * np.eye(covariance.shape[0], dtype=float)
+    diff = truth - mean
+    inv_covariance = np.linalg.pinv(covariance)
+    distance_sq = float(diff.T @ inv_covariance @ diff)
+    return float(np.sqrt(max(distance_sq, 0.0)))
+
+
 def noisy_relative_measurement(
     observer_position: np.ndarray,
     observer_theta: float,
@@ -132,10 +158,29 @@ def noisy_relative_measurement(
     rng: np.random.Generator,
 ) -> list[float]:
     # Generate noisy range-bearing observations from observer frame.
+    def contaminated_gaussian(std: float, outlier_prob: float, outlier_scale: float) -> float:
+        if std <= 0.0:
+            return 0.0
+        scale = float(outlier_scale) if rng.random() < float(outlier_prob) else 1.0
+        return float(rng.normal(0.0, std * scale))
+
     target_position = np.asarray(target_position, dtype=float).reshape(-1)
     delta = target_position - np.asarray(observer_position, dtype=float).reshape(-1)
-    distance = max(1.0e-6, float(linalg.norm(delta) + rng.normal(0.0, np.sqrt(range_var))))
-    bearing = atan2(delta[1], delta[0]) + rng.normal(0.0, np.sqrt(bearing_var)) - observer_theta
+    range_std = float(np.sqrt(max(float(range_var), 0.0)))
+    bearing_std = float(np.sqrt(max(float(bearing_var), 0.0)))
+    distance_noise = contaminated_gaussian(
+        std=range_std,
+        outlier_prob=RANGE_OUTLIER_PROB,
+        outlier_scale=RANGE_OUTLIER_SCALE,
+    )
+    bearing_noise = contaminated_gaussian(
+        std=bearing_std,
+        outlier_prob=BEARING_OUTLIER_PROB,
+        outlier_scale=BEARING_OUTLIER_SCALE,
+    )
+    distance = max(1.0e-6, float(linalg.norm(delta) + distance_noise))
+    bearing = atan2(delta[1], delta[0]) + bearing_noise - observer_theta
+    bearing = (float(bearing) + np.pi) % (2.0 * np.pi) - np.pi
     return [distance, bearing]
 
 
@@ -294,6 +339,17 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
                 agent_class.value: float(epsilon_by_class[agent_class])
                 for agent_class in AgentClass
             },
+            "measurement_noise_model": "contaminated_gaussian",
+            "measurement_noise_params": {
+                "range": {
+                    "outlier_prob": float(RANGE_OUTLIER_PROB),
+                    "outlier_scale": float(RANGE_OUTLIER_SCALE),
+                },
+                "bearing": {
+                    "outlier_prob": float(BEARING_OUTLIER_PROB),
+                    "outlier_scale": float(BEARING_OUTLIER_SCALE),
+                },
+            },
         },
         "samples_by_class": dataset_by_class,
     }
@@ -437,12 +493,131 @@ def load_calibration_dataset(path: Path) -> dict[str, object]:
     )
 
 
+def print_all_sample_scores(dataset: dict[str, object]) -> None:
+    # Print every calibration sample with truth, posterior, covariance, and CP score.
+    samples_by_class = dataset["samples_by_class"]
+    print("Calibration samples with CP scores:")
+    for class_name in sorted(samples_by_class.keys()):
+        samples = samples_by_class[class_name]
+        print(f"[{class_name}] {len(samples)} samples")
+        for sample_idx, sample in enumerate(samples):
+            agent_id = int(sample["agent_id"])
+            ii = 2 * agent_id
+            truth_state = np.asarray(sample["ground_truth_state"], dtype=float).reshape(-1)
+            posterior_mean = np.asarray(sample["posterior_mean"], dtype=float).reshape(-1)
+            posterior_covariance = np.asarray(sample["posterior_covariance"], dtype=float)
+            truth_xy = truth_state[ii:ii + 2]
+            mean_xy = posterior_mean[ii:ii + 2]
+            covariance_xy = posterior_covariance[ii:ii + 2, ii:ii + 2]
+            score = mahalanobis_radius(
+                mean=mean_xy,
+                covariance=covariance_xy,
+                truth=truth_xy,
+            )
+            truth_repr = np.array2string(truth_xy, precision=6, separator=", ")
+            mean_repr = np.array2string(mean_xy, precision=6, separator=", ")
+            covariance_repr = np.array2string(covariance_xy, precision=6, separator=", ")
+            print(
+                "  "
+                f"sample={sample_idx} "
+                f"episode={int(sample['episode_id'])} "
+                f"t={int(sample['time_index'])} "
+                f"agent={agent_id} "
+                f"score={score:.9f}"
+            )
+            print(f"    truth_xy={truth_repr}")
+            print(f"    mean_xy={mean_repr}")
+            print(f"    cov_xy={covariance_repr}")
+
+
+def save_score_histogram(dataset: dict[str, object], output_path: Path) -> None:
+    # Save per-class histograms of CP nonconformity scores.
+    mplconfig_dir = output_path.parent / ".mplconfig"
+    mplconfig_dir.mkdir(parents=True, exist_ok=True)
+
+    import os
+
+    os.environ.setdefault("MPLCONFIGDIR", str(mplconfig_dir))
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    samples_by_class = dataset["samples_by_class"]
+    class_names = sorted(samples_by_class.keys())
+    if not class_names:
+        return
+
+    scores_by_class: dict[str, np.ndarray] = {}
+    for class_name in class_names:
+        class_scores: list[float] = []
+        for sample in samples_by_class[class_name]:
+            agent_id = int(sample["agent_id"])
+            ii = 2 * agent_id
+            truth_state = np.asarray(sample["ground_truth_state"], dtype=float).reshape(-1)
+            posterior_mean = np.asarray(sample["posterior_mean"], dtype=float).reshape(-1)
+            posterior_covariance = np.asarray(sample["posterior_covariance"], dtype=float)
+            score = mahalanobis_radius(
+                mean=posterior_mean[ii:ii + 2],
+                covariance=posterior_covariance[ii:ii + 2, ii:ii + 2],
+                truth=truth_state[ii:ii + 2],
+            )
+            class_scores.append(float(score))
+        scores_by_class[class_name] = np.asarray(class_scores, dtype=float)
+
+    num_classes = len(class_names)
+    cols = min(2, num_classes)
+    rows = int(np.ceil(num_classes / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(7.2 * cols, 4.2 * rows), squeeze=False)
+    flat_axes = axes.ravel()
+
+    for idx, class_name in enumerate(class_names):
+        ax = flat_axes[idx]
+        class_scores = scores_by_class[class_name]
+        if class_scores.size == 0:
+            ax.text(0.5, 0.5, "No samples", ha="center", va="center")
+            ax.set_title(class_name)
+            ax.set_xlabel("score")
+            ax.set_ylabel("count")
+            ax.grid(alpha=0.25)
+            continue
+
+        bins = int(min(50, max(10, round(np.sqrt(class_scores.size)))))
+        ax.hist(
+            class_scores,
+            bins=bins,
+            color=(0.2, 0.4, 0.75),
+            edgecolor="black",
+            alpha=0.8,
+        )
+        ax.set_title(f"{class_name} (n={class_scores.size})")
+        ax.set_xlabel("score")
+        ax.set_ylabel("count")
+        ax.grid(alpha=0.25)
+
+    for idx in range(num_classes, len(flat_axes)):
+        flat_axes[idx].axis("off")
+
+    fig.suptitle("Calibration Score Histograms by Agent Class", fontsize=14)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     # End-to-end entrypoint used from command line.
     args = parse_args()
     dataset = collect_dataset(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     save_calibration_dataset(args.output, dataset)
+    histogram_path = (
+        args.score_histogram_path.resolve()
+        if args.score_histogram_path is not None
+        else args.output.resolve().with_name(f"{args.output.resolve().stem}_score_histogram.png")
+    )
+    save_score_histogram(dataset, histogram_path)
+    print(f"Saved score histogram to {histogram_path}")
+    print_all_sample_scores(dataset)
 
     samples_by_class = dataset["samples_by_class"]
     total_samples = sum(len(samples) for samples in samples_by_class.values())

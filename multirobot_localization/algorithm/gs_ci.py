@@ -164,6 +164,7 @@ class GS_CI:
 		comm_robot_class=None,
 		class_quantiles=None,
 		ci_coeff=None,
+		use_quantiles=True,
 	):
 		"""Fuse a communicated estimate using class-conditional calibrated CI.
 
@@ -176,12 +177,25 @@ class GS_CI:
 		ci_coeff = self.ci_coeff if ci_coeff is None else float(ci_coeff)
 		remote_state = matrix(comm_robot_s, dtype=float)
 		remote_class = normalize_agent_class(comm_robot_class or self.agent_class)
+		use_quantiles = bool(use_quantiles)
 
-		quantiles = self.class_quantiles.copy()
-		quantiles.update(self._normalize_quantile_map(class_quantiles))
-
-		local_sigma_tilde = self._calibrated_covariance(self.sigma, agent_class=self.agent_class, class_quantiles=quantiles)
-		remote_sigma_tilde = self._calibrated_covariance(comm_robot_sigma, agent_class=remote_class, class_quantiles=quantiles)
+		quantiles = {}
+		if use_quantiles:
+			quantiles = self.class_quantiles.copy()
+			quantiles.update(self._normalize_quantile_map(class_quantiles))
+			local_sigma_tilde = self._calibrated_covariance(
+				self.sigma,
+				agent_class=self.agent_class,
+				class_quantiles=quantiles,
+			)
+			remote_sigma_tilde = self._calibrated_covariance(
+				comm_robot_sigma,
+				agent_class=remote_class,
+				class_quantiles=quantiles,
+			)
+		else:
+			local_sigma_tilde = self._symmetrize(self.sigma)
+			remote_sigma_tilde = self._symmetrize(comm_robot_sigma)
 
 		T_j_minus = self._sender_orientation_mask()
 		T_i_plus = self._receiver_orientation_mask()
@@ -203,11 +217,13 @@ class GS_CI:
 		self.s = fused_state
 		self.sigma = fused_covariance
 
-		q_sup = 1.0
-		if quantiles:
+		if use_quantiles and quantiles:
 			q_sup = max(float(value) for value in quantiles.values())
-		local_th_sigma_tilde = self._symmetrize(q_sup * np.asarray(self.th_sigma, dtype=float))
-		remote_th_sigma_tilde = self._symmetrize(q_sup * np.asarray(comm_robot_th_sigma, dtype=float))
+			local_th_sigma_tilde = self._symmetrize(q_sup * np.asarray(self.th_sigma, dtype=float))
+			remote_th_sigma_tilde = self._symmetrize(q_sup * np.asarray(comm_robot_th_sigma, dtype=float))
+		else:
+			local_th_sigma_tilde = self._symmetrize(self.th_sigma)
+			remote_th_sigma_tilde = self._symmetrize(comm_robot_th_sigma)
 		fused_th_information = self._symmetrize(
 			ci_coeff * self._stable_information(local_th_sigma_tilde)
 			+ (1 - ci_coeff) * self._stable_information(remote_th_sigma_tilde)

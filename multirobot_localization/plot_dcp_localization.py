@@ -104,8 +104,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dcp-step-size",
         type=float,
-        default=0.35,
-        help="Initial DCP subgradient step size. The implementation uses 1/sqrt(k) decay.",
+        default=0.1,
+        help="DCP subgradient step size (constant, matching src/tracking/conformal_prediction.py).",
     )
     parser.add_argument(
         "--tube-alpha",
@@ -233,55 +233,78 @@ def run_distributed_classwise_dcp(
     num_steps: int,
     step_size: float,
 ) -> DCPDiagnostics:
-    # Distributed subgradient routine run independently per class partition.
+    # Algorithm 2 style class-conditional distributed subgradient + consensus.
     num_agents = len(agent_classes)
-    quantile_history = np.zeros((num_agents, num_steps + 1), dtype=float)
-    local_quantiles = np.zeros(num_agents, dtype=float)
-    final_quantiles = np.zeros(num_agents, dtype=float)
-    sample_counts = np.zeros(num_agents, dtype=int)
-    centralized_class_quantiles: dict[str, float] = {}
-
-    # Initialize each agent from its local split-conformal quantile.
-    for agent_id in range(num_agents):
-        agent_class = normalize_agent_class(agent_classes[agent_id])
-        local_scores = np.asarray(scores_by_agent[agent_id], dtype=float)
-        local_quantiles[agent_id], _ = split_conformal_quantile(local_scores, alpha_by_class[agent_class])
-        quantile_history[agent_id, 0] = local_quantiles[agent_id]
-        sample_counts[agent_id] = int(local_scores.size)
-
-    # Solve one class-specific DCP problem for each present class.
     unique_classes = [normalize_agent_class(agent_class) for agent_class in dict.fromkeys(agent_classes)]
+    class_to_idx = {agent_class: idx for idx, agent_class in enumerate(unique_classes)}
+    num_classes = len(unique_classes)
+
+    local_scores_by_agent_class: dict[int, dict[AgentClass, np.ndarray]] = {}
+    for agent_id in range(num_agents):
+        local_scores_by_agent_class[agent_id] = {
+            agent_class: np.asarray([], dtype=float)
+            for agent_class in unique_classes
+        }
+        own_class = normalize_agent_class(agent_classes[agent_id])
+        local_scores_by_agent_class[agent_id][own_class] = np.asarray(scores_by_agent[agent_id], dtype=float).reshape(-1)
+
+    # Initialize Q_{i,0}[c] = 0 for all agents and classes.
+    current = np.zeros((num_agents, num_classes), dtype=float)
+
+    own_class_indices = np.array(
+        [class_to_idx[normalize_agent_class(agent_class)] for agent_class in agent_classes],
+        dtype=int,
+    )
+    quantile_history = np.zeros((num_agents, num_steps + 1), dtype=float)
+    quantile_history[:, 0] = current[np.arange(num_agents), own_class_indices]
+
+    sample_counts = np.array(
+        [int(local_scores_by_agent_class[agent_id][normalize_agent_class(agent_classes[agent_id])].size) for agent_id in range(num_agents)],
+        dtype=int,
+    )
+
+    centralized_class_quantiles: dict[str, float] = {}
     for agent_class in unique_classes:
-        class_agent_ids = [
-            agent_id
-            for agent_id, class_name in enumerate(agent_classes)
-            if normalize_agent_class(class_name) == agent_class
-        ]
-        class_scores = np.concatenate([scores_by_agent[agent_id] for agent_id in class_agent_ids], axis=0)
-        _, tau = split_conformal_quantile(class_scores, alpha_by_class[agent_class])
+        class_scores = np.concatenate(
+            [
+                local_scores_by_agent_class[agent_id][agent_class]
+                for agent_id in range(num_agents)
+                if local_scores_by_agent_class[agent_id][agent_class].size > 0
+            ],
+            axis=0,
+        )
         centralized_class_quantiles[agent_class.value] = split_conformal_quantile(
             class_scores,
             alpha_by_class[agent_class],
         )[0]
 
-        current = quantile_history[class_agent_ids, 0].copy()
-        mixing_weights = cycle_metropolis_weights(len(class_agent_ids))
+    mixing_weights = cycle_metropolis_weights(num_agents)
+    for step in range(1, num_steps + 1):
+        gradients = np.zeros_like(current)
+        for agent_id in range(num_agents):
+            for agent_class in unique_classes:
+                class_idx = class_to_idx[agent_class]
+                scores_ic = local_scores_by_agent_class[agent_id][agent_class]
+                if scores_ic.size == 0:
+                    gradients[agent_id, class_idx] = 0.0
+                    continue
+                tau_c = 1.0 - float(alpha_by_class[agent_class])
+                gradients[agent_id, class_idx] = float(
+                    np.mean(
+                        np.where(
+                            scores_ic > current[agent_id, class_idx],
+                            -tau_c,
+                            1.0 - tau_c,
+                        )
+                    )
+                )
 
-        for step in range(1, num_steps + 1):
-            # Consensus + subgradient correction with 1/sqrt(k) step decay.
-            mixed_estimate = mixing_weights @ current
-            step_scale = float(step_size) / np.sqrt(step)
-            gradients = np.array(
-                [
-                    np.mean(scores_by_agent[agent_id] <= current[local_idx]) - tau
-                    for local_idx, agent_id in enumerate(class_agent_ids)
-                ],
-                dtype=float,
-            )
-            current = np.maximum(mixed_estimate - step_scale * gradients, 1.0e-6)
-            quantile_history[class_agent_ids, step] = current
+        intermediate = current - float(step_size) * gradients
+        current = np.maximum(mixing_weights @ intermediate, 1.0e-6)
+        quantile_history[:, step] = current[np.arange(num_agents), own_class_indices]
 
-        final_quantiles[class_agent_ids] = current
+    final_quantiles = current[np.arange(num_agents), own_class_indices]
+    local_quantiles = quantile_history[:, 0].copy()
 
     return DCPDiagnostics(
         quantile_history=quantile_history,

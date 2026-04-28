@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from math import atan2, cos, sin
+from pathlib import Path
 
 import numpy as np
 
@@ -16,6 +17,12 @@ from formation_control import (
 )
 from robot import Robot
 from topology import sample_topologies
+
+
+RANGE_OUTLIER_PROB = 0.05
+RANGE_OUTLIER_SCALE = 6.0
+BEARING_OUTLIER_PROB = 0.03
+BEARING_OUTLIER_SCALE = 4.0
 
 
 def default_epsilon_by_class(
@@ -137,10 +144,29 @@ def noisy_relative_measurement(
     rng: np.random.Generator,
 ) -> list[float]:
     # Shared noisy range-bearing observation model used in simulation and calibration.
+    def contaminated_gaussian(std: float, outlier_prob: float, outlier_scale: float) -> float:
+        if std <= 0.0:
+            return 0.0
+        scale = float(outlier_scale) if rng.random() < float(outlier_prob) else 1.0
+        return float(rng.normal(0.0, std * scale))
+
     target_position = np.asarray(target_position, dtype=float).reshape(-1)
     delta = target_position - np.asarray(observer_position, dtype=float).reshape(-1)
-    distance = max(1.0e-6, float(np.linalg.norm(delta) + rng.normal(0.0, np.sqrt(range_var))))
-    bearing = atan2(delta[1], delta[0]) + rng.normal(0.0, np.sqrt(bearing_var)) - observer_theta
+    range_std = float(np.sqrt(max(float(range_var), 0.0)))
+    bearing_std = float(np.sqrt(max(float(bearing_var), 0.0)))
+    distance_noise = contaminated_gaussian(
+        std=range_std,
+        outlier_prob=RANGE_OUTLIER_PROB,
+        outlier_scale=RANGE_OUTLIER_SCALE,
+    )
+    bearing_noise = contaminated_gaussian(
+        std=bearing_std,
+        outlier_prob=BEARING_OUTLIER_PROB,
+        outlier_scale=BEARING_OUTLIER_SCALE,
+    )
+    distance = max(1.0e-6, float(np.linalg.norm(delta) + distance_noise))
+    bearing = atan2(delta[1], delta[0]) + bearing_noise - observer_theta
+    bearing = (float(bearing) + np.pi) % (2.0 * np.pi) - np.pi
     return [distance, bearing]
 
 
@@ -161,6 +187,296 @@ def _normalized_quantiles(class_quantiles: dict[AgentClass | str, float] | None)
         normalize_agent_class(agent_class): float(quantile)
         for agent_class, quantile in class_quantiles.items()
     }
+
+
+def _split_conformal_quantile(scores: np.ndarray, alpha: float) -> tuple[float, float]:
+    scores = np.asarray(scores, dtype=float)
+    if scores.ndim != 1 or scores.size == 0:
+        raise ValueError("scores must be a non-empty 1D array")
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0, 1)")
+    n = scores.size
+    tau = float(np.ceil((n + 1) * (1.0 - alpha)) / n)
+    tau = min(max(tau, 0.0), 1.0)
+    return float(np.quantile(scores, tau, method="higher")), tau
+
+
+def _mahalanobis_radius(mean: np.ndarray, covariance: np.ndarray, truth: np.ndarray) -> float:
+    mean = np.asarray(mean, dtype=float).reshape(-1)
+    truth = np.asarray(truth, dtype=float).reshape(-1)
+    covariance = np.asarray(covariance, dtype=float)
+    covariance = 0.5 * (covariance + covariance.T)
+    covariance += 1.0e-12 * np.eye(covariance.shape[0], dtype=float)
+    diff = truth - mean
+    inv_covariance = np.linalg.pinv(covariance)
+    distance_sq = float(diff.T @ inv_covariance @ diff)
+    return float(np.sqrt(max(distance_sq, 0.0)))
+
+
+def _doubly_stochastic_weights_from_comm_edges(
+    agent_ids: list[int],
+    comm_edges: list[list[int]],
+) -> np.ndarray:
+    # Build doubly stochastic Metropolis weights from communication-neighbor relations.
+    # Directed edges are symmetrized into an undirected neighbor graph.
+    num_agents = len(agent_ids)
+    if num_agents <= 0:
+        raise ValueError("agent_ids must be non-empty")
+
+    id_to_local = {int(agent_id): local_idx for local_idx, agent_id in enumerate(agent_ids)}
+    neighbors = [set() for _ in range(num_agents)]
+    for edge in comm_edges:
+        if len(edge) != 2:
+            continue
+        sender = int(edge[0])
+        receiver = int(edge[1])
+        if sender == receiver:
+            continue
+        sender_local = id_to_local.get(sender)
+        receiver_local = id_to_local.get(receiver)
+        if sender_local is None or receiver_local is None:
+            continue
+        neighbors[sender_local].add(receiver_local)
+        neighbors[receiver_local].add(sender_local)
+
+    weights = np.zeros((num_agents, num_agents), dtype=float)
+    degrees = np.array([len(nbrs) for nbrs in neighbors], dtype=float)
+    for i in range(num_agents):
+        for j in sorted(neighbors[i]):
+            weights[i, j] = 1.0 / (1.0 + max(degrees[i], degrees[j]))
+        weights[i, i] = 1.0 - weights[i].sum()
+    return weights
+
+
+def _augment_comm_edges_with_joiners(
+    base_comm_edges: list[list[int]],
+    base_agent_count: int,
+    joiner_agent_ids: list[int],
+    comm_prob: float,
+    rng: np.random.Generator,
+) -> list[list[int]]:
+    # Preserve existing rollout comm edges and sample joiner-related links with same Bernoulli model.
+    edge_set: set[tuple[int, int]] = set()
+    for edge in base_comm_edges:
+        if len(edge) != 2:
+            continue
+        sender = int(edge[0])
+        receiver = int(edge[1])
+        if 0 <= sender < base_agent_count and 0 <= receiver < base_agent_count and sender != receiver:
+            edge_set.add((sender, receiver))
+
+    all_agent_ids = list(range(base_agent_count)) + [int(agent_id) for agent_id in joiner_agent_ids]
+    for sender in all_agent_ids:
+        for receiver in all_agent_ids:
+            if sender == receiver:
+                continue
+            if sender < base_agent_count and receiver < base_agent_count:
+                continue
+            if rng.random() < float(comm_prob):
+                edge_set.add((sender, receiver))
+
+    return [[sender, receiver] for sender, receiver in sorted(edge_set)]
+
+
+def _load_classwise_calibration_score_pools(
+    dataset_path: Path,
+) -> tuple[dict[AgentClass, np.ndarray], dict[AgentClass, float]]:
+    # Local import prevents top-level circular dependency with data collector.
+    from collect_calibration_data import load_calibration_dataset
+
+    if not dataset_path.exists():
+        raise FileNotFoundError(
+            f"Calibration dataset not found at {dataset_path}. "
+            "Run multirobot_localization/collect_calibration_data.py first."
+        )
+
+    dataset = load_calibration_dataset(dataset_path)
+    class_scores: dict[AgentClass, list[float]] = {}
+    alpha_by_class: dict[AgentClass, float] = {}
+
+    for class_name, samples in dataset["samples_by_class"].items():
+        agent_class = normalize_agent_class(class_name)
+        class_scores.setdefault(agent_class, [])
+
+        for sample in samples:
+            agent_id = int(sample["agent_id"])
+            truth_state = np.asarray(sample["ground_truth_state"], dtype=float).reshape(-1)
+            posterior_mean = np.asarray(sample["posterior_mean"], dtype=float).reshape(-1)
+            posterior_covariance = np.asarray(sample["posterior_covariance"], dtype=float)
+            state_index = 2 * agent_id
+
+            score = _mahalanobis_radius(
+                mean=posterior_mean[state_index:state_index + 2],
+                covariance=posterior_covariance[state_index:state_index + 2, state_index:state_index + 2],
+                truth=truth_state[state_index:state_index + 2],
+            )
+            class_scores[agent_class].append(score)
+            alpha_by_class[agent_class] = float(sample["epsilon"])
+
+    class_score_arrays = {
+        agent_class: np.asarray(scores, dtype=float)
+        for agent_class, scores in class_scores.items()
+    }
+    return class_score_arrays, alpha_by_class
+
+
+def _load_online_dcp_calibration_scores(
+    dataset_path: Path,
+    agent_classes: list[AgentClass],
+) -> tuple[dict[int, np.ndarray], dict[AgentClass, float]]:
+    class_score_arrays, alpha_by_class = _load_classwise_calibration_score_pools(dataset_path)
+    scores_by_agent: dict[int, list[float]] = {agent_id: [] for agent_id in range(len(agent_classes))}
+
+    for agent_class, class_scores in class_score_arrays.items():
+        if class_scores.size == 0:
+            continue
+        class_agent_ids = [
+            agent_id
+            for agent_id, class_name in enumerate(agent_classes)
+            if normalize_agent_class(class_name) == agent_class
+        ]
+        if not class_agent_ids:
+            continue
+        assignments = np.array_split(class_scores, len(class_agent_ids))
+        for local_idx, agent_id in enumerate(class_agent_ids):
+            assigned_scores = np.asarray(assignments[local_idx], dtype=float).reshape(-1)
+            scores_by_agent[agent_id].extend(float(value) for value in assigned_scores.tolist())
+
+    for agent_id, agent_class in enumerate(agent_classes):
+        if scores_by_agent[agent_id]:
+            continue
+        class_scores = class_score_arrays.get(agent_class)
+        if class_scores is None or class_scores.size == 0:
+            raise ValueError(f"No calibration scores found for agent {agent_id} ({agent_class.value})")
+        scores_by_agent[agent_id] = [float(value) for value in class_scores.tolist()]
+
+    return (
+        {agent_id: np.asarray(scores, dtype=float) for agent_id, scores in scores_by_agent.items()},
+        alpha_by_class,
+    )
+
+
+def _run_startup_distributed_classwise_dcp(
+    scores_by_agent: dict[int, np.ndarray],
+    agent_classes: list[AgentClass],
+    alpha_by_class: dict[AgentClass, float],
+    comm_edges: list[list[int]],
+    num_steps: int,
+    step_size: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[AgentClass]]:
+    # Algorithm 2 implementation:
+    # 1) local classwise subgradient, 2) local descent step, 3) communication, 4) consensus update.
+    num_agents = len(agent_classes)
+    unique_classes = [normalize_agent_class(agent_class) for agent_class in dict.fromkeys(agent_classes)]
+    class_to_idx = {agent_class: idx for idx, agent_class in enumerate(unique_classes)}
+    num_classes = len(unique_classes)
+
+    # Local partitioned datasets D_{i,c}. In this scenario each agent contributes its class data,
+    # and other class partitions are empty by default.
+    local_scores_by_agent_class: dict[int, dict[AgentClass, np.ndarray]] = {}
+    for agent_id in range(num_agents):
+        local_scores_by_agent_class[agent_id] = {
+            agent_class: np.asarray([], dtype=float)
+            for agent_class in unique_classes
+        }
+        own_class = normalize_agent_class(agent_classes[agent_id])
+        local_scores_by_agent_class[agent_id][own_class] = np.asarray(scores_by_agent[agent_id], dtype=float).reshape(-1)
+
+    # Initialize Q_{i,0}[c] = 0 for all agents and classes.
+    current = np.zeros((num_agents, num_classes), dtype=float)
+
+    own_class_indices = np.array(
+        [class_to_idx[normalize_agent_class(agent_class)] for agent_class in agent_classes],
+        dtype=int,
+    )
+    quantile_history = np.zeros((num_agents, int(num_steps) + 1), dtype=float)
+    quantile_history[:, 0] = current[np.arange(num_agents), own_class_indices]
+
+    # Doubly stochastic communication weights W.
+    mixing_weights = _doubly_stochastic_weights_from_comm_edges(
+        agent_ids=[int(agent_id) for agent_id in range(num_agents)],
+        comm_edges=comm_edges,
+    )
+
+    for step in range(1, int(num_steps) + 1):
+        gradients = np.zeros_like(current)
+        for agent_id in range(num_agents):
+            for agent_class in unique_classes:
+                class_idx = class_to_idx[agent_class]
+                scores_ic = local_scores_by_agent_class[agent_id][agent_class]
+                if scores_ic.size == 0:
+                    gradients[agent_id, class_idx] = 0.0
+                    continue
+                tau_c = 1.0 - float(alpha_by_class[agent_class])
+                gradients[agent_id, class_idx] = float(
+                    np.mean(
+                        np.where(
+                            scores_ic > current[agent_id, class_idx],
+                            -tau_c,
+                            1.0 - tau_c,
+                        )
+                    )
+                )
+
+        # Local descent step: \tilde{Q}_{i,t} = Q_{i,t-1} - eta_t g_i(Q_{i,t-1})
+        intermediate = current - float(step_size) * gradients
+
+        # Consensus update: Q_{i,t} = \sum_j W_{ij} \tilde{Q}_{j,t}
+        current = np.maximum(mixing_weights @ intermediate, 1.0e-6)
+        quantile_history[:, step] = current[np.arange(num_agents), own_class_indices]
+
+    final_quantiles = current[np.arange(num_agents), own_class_indices]
+    return final_quantiles, quantile_history, current.copy(), unique_classes
+
+
+def _agent_class_quantile_maps(
+    quantile_matrix: np.ndarray,
+    class_order: list[AgentClass],
+) -> list[dict[AgentClass, float]]:
+    quantile_matrix = np.asarray(quantile_matrix, dtype=float)
+    num_agents = int(quantile_matrix.shape[0])
+    maps: list[dict[AgentClass, float]] = []
+    for agent_id in range(num_agents):
+        maps.append(
+            {
+                normalize_agent_class(agent_class): float(quantile_matrix[agent_id, class_idx])
+                for class_idx, agent_class in enumerate(class_order)
+            }
+        )
+    return maps
+
+
+def _classwise_average_from_agent_maps(
+    agent_quantile_maps: list[dict[AgentClass, float]],
+    class_order: list[AgentClass],
+) -> dict[AgentClass, float]:
+    result: dict[AgentClass, float] = {}
+    if not agent_quantile_maps:
+        return result
+    for agent_class in class_order:
+        normalized_class = normalize_agent_class(agent_class)
+        values = [
+            float(agent_quantile_map[normalized_class])
+            for agent_quantile_map in agent_quantile_maps
+            if normalized_class in agent_quantile_map
+        ]
+        if values:
+            result[normalized_class] = float(np.mean(np.asarray(values, dtype=float)))
+    return result
+
+
+def _sample_class_scores_for_joiner(
+    class_scores: np.ndarray,
+    sample_count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    class_scores = np.asarray(class_scores, dtype=float).reshape(-1)
+    if class_scores.size == 0:
+        raise ValueError("Cannot sample joiner scores from an empty class score pool")
+    count = max(1, int(sample_count))
+    replace = count > class_scores.size
+    chosen = rng.choice(class_scores, size=count, replace=replace)
+    return np.asarray(chosen, dtype=float).reshape(-1)
 
 
 def rollout_ground_truth_episode(
@@ -229,6 +545,12 @@ def simulate_class_conditional_gs_ci_rollout(
     ci_coeff: float = 0.8,
     motion_mode: str = "random",
     formation_controller: EstimateDrivenFormationController | None = None,
+    dcp_calibration_dataset: Path | str | None = None,
+    dcp_steps: int = 250,
+    dcp_step_size: float = 0.5,
+    dcp_mid_join_step: int | None = None,
+    dcp_mid_join_dataset: Path | str | None = None,
+    dcp_mid_join_samples_per_joiner: int = 48,
 ) -> dict[str, object]:
     """Run one heterogeneous GS-CI rollout and collect rendering diagnostics."""
 
@@ -243,16 +565,42 @@ def simulate_class_conditional_gs_ci_rollout(
     if motion_mode not in {"random", "formation"}:
         raise ValueError("motion_mode must be 'random' or 'formation'")
 
+    startup_dataset_path = (
+        Path(dcp_calibration_dataset).expanduser().resolve()
+        if dcp_calibration_dataset is not None
+        else None
+    )
+    mid_join_dataset_path = (
+        Path(dcp_mid_join_dataset).expanduser().resolve()
+        if dcp_mid_join_dataset is not None
+        else startup_dataset_path
+    )
+    mid_join_step = None if dcp_mid_join_step is None else int(dcp_mid_join_step)
+    if mid_join_step is not None and (mid_join_step < 0 or mid_join_step >= int(num_steps)):
+        raise ValueError("dcp_mid_join_step must be within [0, num_steps - 1]")
+
+    online_dcp: dict[str, object] = {
+        "enabled": bool(startup_dataset_path is not None or mid_join_step is not None),
+        "startup": {
+            "enabled": bool(startup_dataset_path is not None),
+            "dataset_path": None if startup_dataset_path is None else str(startup_dataset_path),
+            "steps": int(dcp_steps),
+            "step_size": float(dcp_step_size),
+            "consensus_topology": "doubly_stochastic_metropolis_over_scenario_comm_neighbors",
+        },
+        "mid_join": {
+            "enabled": bool(mid_join_step is not None),
+            "step": None if mid_join_step is None else int(mid_join_step),
+            "dataset_path": None if mid_join_dataset_path is None else str(mid_join_dataset_path),
+            "samples_per_joiner": int(dcp_mid_join_samples_per_joiner),
+            "joiner_classes": [AgentClass.CLASS_A_UGV.value, AgentClass.CLASS_B_UAV.value],
+            "consensus_topology": "doubly_stochastic_metropolis_over_augmented_comm_neighbors",
+        },
+        "events": [],
+    }
+
     initial_state = sample_initial_state(rng, jitter_std=initial_jitter_std)
     truth_robots = build_ground_truth_team(initial_state, agent_classes, epsilon_by_class)
-    gs_ci_robots = build_local_filters(
-        initial_state=initial_state,
-        agent_classes=agent_classes,
-        epsilon_by_class=epsilon_by_class,
-        class_quantiles=class_quantiles,
-        ci_coeff=ci_coeff,
-    )
-
     landmarks = [
         sim_env.Landmark(
             0,
@@ -267,14 +615,86 @@ def simulate_class_conditional_gs_ci_rollout(
         rng=rng,
     )
 
+    dcp_scores_by_agent: dict[int, np.ndarray] | None = None
+    alpha_by_class: dict[AgentClass, float] = {}
+    dcp_class_order = [normalize_agent_class(agent_class) for agent_class in dict.fromkeys(agent_classes)]
+    agent_quantile_maps = [
+        {
+            normalize_agent_class(agent_class): float(class_quantiles[normalize_agent_class(agent_class)])
+            for agent_class in dcp_class_order
+        }
+        for _ in range(len(agent_classes))
+    ]
+    if startup_dataset_path is not None:
+        dcp_scores_by_agent, alpha_by_class = _load_online_dcp_calibration_scores(
+            dataset_path=startup_dataset_path,
+            agent_classes=list(agent_classes),
+        )
+        final_agent_quantiles, startup_quantile_history, startup_quantile_matrix, startup_class_order = _run_startup_distributed_classwise_dcp(
+            scores_by_agent=dcp_scores_by_agent,
+            agent_classes=list(agent_classes),
+            alpha_by_class=alpha_by_class,
+            comm_edges=[edge.copy() for edge in comm_topology.edges],
+            num_steps=dcp_steps,
+            step_size=dcp_step_size,
+        )
+        dcp_class_order = [normalize_agent_class(agent_class) for agent_class in startup_class_order]
+        agent_quantile_maps = _agent_class_quantile_maps(
+            quantile_matrix=startup_quantile_matrix,
+            class_order=dcp_class_order,
+        )
+        class_quantiles.update(
+            _classwise_average_from_agent_maps(
+                agent_quantile_maps=agent_quantile_maps,
+                class_order=dcp_class_order,
+            )
+        )
+        online_dcp["startup"].update(
+            {
+                "sample_counts": {str(agent_id): int(scores.size) for agent_id, scores in dcp_scores_by_agent.items()},
+                "alpha_by_class": {agent_class.value: float(value) for agent_class, value in alpha_by_class.items()},
+                "final_agent_quantiles": [float(value) for value in final_agent_quantiles.tolist()],
+                "final_agent_quantile_maps": [
+                    {agent_class.value: float(value) for agent_class, value in agent_quantile_map.items()}
+                    for agent_quantile_map in agent_quantile_maps
+                ],
+                "final_class_quantiles": {agent_class.value: float(value) for agent_class, value in class_quantiles.items()},
+                "quantile_history": startup_quantile_history.tolist(),
+                "consensus_comm_edges": [edge.copy() for edge in comm_topology.edges],
+            }
+        )
+
+    # Baseline team: original GS-CI (no conformal quantile inflation).
+    gs_ci_baseline_robots = build_local_filters(
+        initial_state=initial_state,
+        agent_classes=agent_classes,
+        epsilon_by_class=epsilon_by_class,
+        class_quantiles=None,
+        ci_coeff=ci_coeff,
+    )
+    # Conformalized team: same GS-CI recursion with local distributed quantile maps.
+    gs_ci_conformal_robots = build_local_filters(
+        initial_state=initial_state,
+        agent_classes=agent_classes,
+        epsilon_by_class=epsilon_by_class,
+        class_quantiles=None,
+        ci_coeff=ci_coeff,
+    )
+    for agent_id, local_filter in enumerate(gs_ci_conformal_robots):
+        local_filter.set_class_quantiles(agent_quantile_maps[agent_id])
+
     frames: list[dict[str, object]] = []
-    position_error = np.zeros((sim_env.N, num_steps), dtype=float)
-    calibrated_cov_trace = np.zeros((sim_env.N, num_steps), dtype=float)
-    raw_cov_trace = np.zeros((sim_env.N, num_steps), dtype=float)
+    baseline_position_error = np.zeros((sim_env.N, num_steps), dtype=float)
+    conformal_position_error = np.zeros((sim_env.N, num_steps), dtype=float)
+    baseline_cov_trace = np.zeros((sim_env.N, num_steps), dtype=float)
+    conformal_cov_trace = np.zeros((sim_env.N, num_steps), dtype=float)
     truth_positions = np.zeros((sim_env.N, num_steps, 2), dtype=float)
-    estimated_positions = np.zeros((sim_env.N, num_steps, 2), dtype=float)
-    raw_covariances = np.zeros((sim_env.N, num_steps, 2, 2), dtype=float)
-    formation_position_error = np.full((sim_env.N, num_steps), np.nan, dtype=float)
+    baseline_estimated_positions = np.zeros((sim_env.N, num_steps, 2), dtype=float)
+    conformal_estimated_positions = np.zeros((sim_env.N, num_steps, 2), dtype=float)
+    baseline_covariances = np.zeros((sim_env.N, num_steps, 2, 2), dtype=float)
+    conformal_covariances = np.zeros((sim_env.N, num_steps, 2, 2), dtype=float)
+    baseline_formation_position_error = np.full((sim_env.N, num_steps), np.nan, dtype=float)
+    conformal_formation_position_error = np.full((sim_env.N, num_steps), np.nan, dtype=float)
     render_altitude = np.zeros((sim_env.N, num_steps), dtype=float)
     current_render_altitude = np.asarray(
         [default_render_altitude(agent_class) for agent_class in agent_classes],
@@ -299,10 +719,138 @@ def simulate_class_conditional_gs_ci_rollout(
             dtype=float,
         )
 
+    mid_join_applied = False
     # Main simulation loop.
     for step_id in range(num_steps):
+        if (
+            (not mid_join_applied)
+            and mid_join_step is not None
+            and step_id == mid_join_step
+        ):
+            if mid_join_dataset_path is None:
+                raise ValueError("mid-scenario DCP join requires a calibration dataset path")
+
+            # If startup DCP was skipped, bootstrap baseline participant data now.
+            if dcp_scores_by_agent is None:
+                dcp_scores_by_agent, alpha_by_class = _load_online_dcp_calibration_scores(
+                    dataset_path=mid_join_dataset_path,
+                    agent_classes=list(agent_classes),
+                )
+
+            join_class_scores, join_alpha_by_class = _load_classwise_calibration_score_pools(mid_join_dataset_path)
+            alpha_by_class.update(join_alpha_by_class)
+
+            if AgentClass.CLASS_A_UGV not in join_class_scores or join_class_scores[AgentClass.CLASS_A_UGV].size == 0:
+                raise ValueError("Mid-join dataset is missing CLASS_A_UGV scores")
+            if AgentClass.CLASS_B_UAV not in join_class_scores or join_class_scores[AgentClass.CLASS_B_UAV].size == 0:
+                raise ValueError("Mid-join dataset is missing CLASS_B_UAV scores")
+
+            if AgentClass.CLASS_A_UGV not in alpha_by_class or AgentClass.CLASS_B_UAV not in alpha_by_class:
+                raise ValueError("Missing class epsilon values required for DCP re-optimization")
+
+            ugv_join_scores = _sample_class_scores_for_joiner(
+                class_scores=join_class_scores[AgentClass.CLASS_A_UGV],
+                sample_count=dcp_mid_join_samples_per_joiner,
+                rng=rng,
+            )
+            uav_join_scores = _sample_class_scores_for_joiner(
+                class_scores=join_class_scores[AgentClass.CLASS_B_UAV],
+                sample_count=dcp_mid_join_samples_per_joiner,
+                rng=rng,
+            )
+
+            extended_scores_by_agent: dict[int, np.ndarray] = {
+                int(agent_id): np.asarray(scores, dtype=float)
+                for agent_id, scores in dcp_scores_by_agent.items()
+            }
+            next_agent_id = max(extended_scores_by_agent.keys(), default=-1) + 1
+            ugv_joiner_id = next_agent_id
+            uav_joiner_id = next_agent_id + 1
+            extended_scores_by_agent[ugv_joiner_id] = ugv_join_scores
+            extended_scores_by_agent[uav_joiner_id] = uav_join_scores
+
+            extended_agent_classes = list(agent_classes) + [
+                AgentClass.CLASS_A_UGV,
+                AgentClass.CLASS_B_UAV,
+            ]
+            mid_join_comm_edges = _augment_comm_edges_with_joiners(
+                base_comm_edges=[edge.copy() for edge in comm_topology.edges],
+                base_agent_count=len(agent_classes),
+                joiner_agent_ids=[ugv_joiner_id, uav_joiner_id],
+                comm_prob=comm_prob,
+                rng=rng,
+            )
+            final_agent_quantiles, mid_join_quantile_history, mid_join_quantile_matrix, mid_join_class_order = _run_startup_distributed_classwise_dcp(
+                scores_by_agent=extended_scores_by_agent,
+                agent_classes=extended_agent_classes,
+                alpha_by_class=alpha_by_class,
+                comm_edges=mid_join_comm_edges,
+                num_steps=dcp_steps,
+                step_size=dcp_step_size,
+            )
+            previous_class_quantiles = _classwise_average_from_agent_maps(
+                agent_quantile_maps=agent_quantile_maps,
+                class_order=dcp_class_order,
+            )
+            dcp_class_order = [normalize_agent_class(agent_class) for agent_class in mid_join_class_order]
+            extended_agent_quantile_maps = _agent_class_quantile_maps(
+                quantile_matrix=mid_join_quantile_matrix,
+                class_order=dcp_class_order,
+            )
+            agent_quantile_maps = extended_agent_quantile_maps[:len(agent_classes)]
+            updated_class_quantiles = _classwise_average_from_agent_maps(
+                agent_quantile_maps=extended_agent_quantile_maps,
+                class_order=dcp_class_order,
+            )
+            class_quantiles.update(updated_class_quantiles)
+
+            # Push refreshed per-agent quantile maps into each conformalized local filter.
+            for agent_id, local_filter in enumerate(gs_ci_conformal_robots):
+                local_filter.set_class_quantiles(agent_quantile_maps[agent_id])
+
+            dcp_scores_by_agent = extended_scores_by_agent
+            mid_join_applied = True
+            online_dcp["events"].append(
+                {
+                    "type": "mid_scenario_join_rerun",
+                    "step": int(step_id),
+                    "joiner_agent_ids": {
+                        "CLASS_A_UGV": int(ugv_joiner_id),
+                        "CLASS_B_UAV": int(uav_joiner_id),
+                    },
+                    "samples_per_joiner": int(dcp_mid_join_samples_per_joiner),
+                    "sample_counts": {
+                        "CLASS_A_UGV": int(ugv_join_scores.size),
+                        "CLASS_B_UAV": int(uav_join_scores.size),
+                    },
+                    "previous_class_quantiles": {
+                        agent_class.value: float(value)
+                        for agent_class, value in previous_class_quantiles.items()
+                    },
+                    "updated_class_quantiles": {
+                        agent_class.value: float(value)
+                        for agent_class, value in updated_class_quantiles.items()
+                    },
+                    "delta_class_quantiles": {
+                        agent_class.value: float(
+                            updated_class_quantiles[agent_class]
+                            - previous_class_quantiles.get(agent_class, 0.0)
+                        )
+                        for agent_class in updated_class_quantiles.keys()
+                    },
+                    "quantile_history": mid_join_quantile_history.tolist(),
+                    "final_agent_quantiles": [float(value) for value in final_agent_quantiles.tolist()],
+                    "final_agent_quantile_maps": [
+                        {agent_class.value: float(value) for agent_class, value in agent_quantile_map.items()}
+                        for agent_quantile_map in agent_quantile_maps
+                    ],
+                    "consensus_comm_edges": [edge.copy() for edge in mid_join_comm_edges],
+                }
+            )
+
         for agent_id in range(sim_env.N):
-            gs_ci_robots[agent_id].theta = truth_robots[agent_id].theta
+            gs_ci_baseline_robots[agent_id].theta = truth_robots[agent_id].theta
+            gs_ci_conformal_robots[agent_id].theta = truth_robots[agent_id].theta
 
         nominal_inputs = [None] * sim_env.N
         realized_inputs = [None] * sim_env.N
@@ -317,13 +865,13 @@ def simulate_class_conditional_gs_ci_rollout(
             else:
                 ii = 2 * agent_id
                 estimated_self_position = np.asarray(
-                    gs_ci_robots[agent_id].s[ii:ii + 2],
+                    gs_ci_baseline_robots[agent_id].s[ii:ii + 2],
                     dtype=float,
                 ).reshape(-1)
                 nominal_inputs[agent_id] = controller.compute_nominal_input(
                     agent_id=agent_id,
                     estimated_position_xy=estimated_self_position,
-                    current_theta=gs_ci_robots[agent_id].theta,
+                    current_theta=gs_ci_baseline_robots[agent_id].theta,
                     robot=robot,
                     dt=dt,
                 )
@@ -342,12 +890,14 @@ def simulate_class_conditional_gs_ci_rollout(
         # Propagate truth and estimator priors.
         for agent_id in range(sim_env.N):
             truth_robots[agent_id].motion_propagation(realized_inputs[agent_id], dt)
-            gs_ci_robots[agent_id].motion_propagation_update(nominal_inputs[agent_id], dt)
+            gs_ci_baseline_robots[agent_id].motion_propagation_update(nominal_inputs[agent_id], dt)
+            gs_ci_conformal_robots[agent_id].motion_propagation_update(nominal_inputs[agent_id], dt)
 
         # Observation update for sampled graph edges.
         for observer_idx, observed_idx in observ_topology.edges:
             observer = truth_robots[observer_idx]
-            local_filter = gs_ci_robots[observer_idx]
+            baseline_filter = gs_ci_baseline_robots[observer_idx]
+            conformal_filter = gs_ci_conformal_robots[observer_idx]
 
             if observed_idx == sim_env.N:
                 if not sim_env.inRange(observer.position, landmark_position_xy):
@@ -356,11 +906,12 @@ def simulate_class_conditional_gs_ci_rollout(
                     observer_position=observer.position,
                     observer_theta=observer.theta,
                     target_position=landmark_position_xy,
-                    range_var=local_filter.var_dis,
-                    bearing_var=local_filter.var_phi,
+                    range_var=baseline_filter.var_dis,
+                    bearing_var=baseline_filter.var_phi,
                     rng=rng,
                 )
-                local_filter.ablt_obsv_update(measurement, landmarks[0])
+                baseline_filter.ablt_obsv_update(measurement, landmarks[0])
+                conformal_filter.ablt_obsv_update(measurement, landmarks[0])
             else:
                 target_robot = truth_robots[observed_idx]
                 if not sim_env.inRange(observer.position, target_robot.position):
@@ -369,20 +920,28 @@ def simulate_class_conditional_gs_ci_rollout(
                     observer_position=observer.position,
                     observer_theta=observer.theta,
                     target_position=target_robot.position,
-                    range_var=local_filter.var_dis,
-                    bearing_var=local_filter.var_phi,
+                    range_var=baseline_filter.var_dis,
+                    bearing_var=baseline_filter.var_phi,
                     rng=rng,
                 )
-                local_filter.rela_obsv_update(observed_idx, measurement)
+                baseline_filter.rela_obsv_update(observed_idx, measurement)
+                conformal_filter.rela_obsv_update(observed_idx, measurement)
 
         # Communication update for sampled message-passing edges.
         for sender_idx, receiver_idx in comm_topology.edges:
-            gs_ci_robots[receiver_idx].comm_update(
-                gs_ci_robots[sender_idx].s,
-                gs_ci_robots[sender_idx].sigma,
-                gs_ci_robots[sender_idx].th_sigma,
-                comm_robot_class=gs_ci_robots[sender_idx].agent_class,
-                class_quantiles=class_quantiles,
+            gs_ci_baseline_robots[receiver_idx].comm_update(
+                gs_ci_baseline_robots[sender_idx].s,
+                gs_ci_baseline_robots[sender_idx].sigma,
+                gs_ci_baseline_robots[sender_idx].th_sigma,
+                comm_robot_class=gs_ci_baseline_robots[sender_idx].agent_class,
+                use_quantiles=False,
+            )
+            gs_ci_conformal_robots[receiver_idx].comm_update(
+                gs_ci_conformal_robots[sender_idx].s,
+                gs_ci_conformal_robots[sender_idx].sigma,
+                gs_ci_conformal_robots[sender_idx].th_sigma,
+                comm_robot_class=gs_ci_conformal_robots[sender_idx].agent_class,
+                class_quantiles=None,
             )
 
         # Collect per-agent diagnostics for plotting/rendering.
@@ -390,21 +949,28 @@ def simulate_class_conditional_gs_ci_rollout(
         for agent_id in range(sim_env.N):
             ii = 2 * agent_id
             truth_position = truth_robots[agent_id].position.copy()
-            estimate = np.asarray(gs_ci_robots[agent_id].s[ii:ii + 2], dtype=float).reshape(-1)
-            sigma_self = np.asarray(gs_ci_robots[agent_id].sigma[ii:ii + 2, ii:ii + 2], dtype=float)
-            quantile = class_quantiles[agent_classes[agent_id]]
-            calibrated_sigma_self = float(quantile) * sigma_self
+            baseline_estimate = np.asarray(gs_ci_baseline_robots[agent_id].s[ii:ii + 2], dtype=float).reshape(-1)
+            conformal_estimate = np.asarray(gs_ci_conformal_robots[agent_id].s[ii:ii + 2], dtype=float).reshape(-1)
+            baseline_sigma_self = np.asarray(gs_ci_baseline_robots[agent_id].sigma[ii:ii + 2, ii:ii + 2], dtype=float)
+            conformal_sigma_self = np.asarray(gs_ci_conformal_robots[agent_id].sigma[ii:ii + 2, ii:ii + 2], dtype=float)
+            quantile = gs_ci_conformal_robots[agent_id].get_class_quantile(agent_class=agent_classes[agent_id])
 
             truth_positions[agent_id, step_id] = truth_position
-            estimated_positions[agent_id, step_id] = estimate
-            raw_covariances[agent_id, step_id] = sigma_self
-            position_error[agent_id, step_id] = float(np.linalg.norm(estimate - truth_position))
-            raw_cov_trace[agent_id, step_id] = float(np.trace(sigma_self))
-            calibrated_cov_trace[agent_id, step_id] = float(np.trace(calibrated_sigma_self))
+            baseline_estimated_positions[agent_id, step_id] = baseline_estimate
+            conformal_estimated_positions[agent_id, step_id] = conformal_estimate
+            baseline_covariances[agent_id, step_id] = baseline_sigma_self
+            conformal_covariances[agent_id, step_id] = conformal_sigma_self
+            baseline_position_error[agent_id, step_id] = float(np.linalg.norm(baseline_estimate - truth_position))
+            conformal_position_error[agent_id, step_id] = float(np.linalg.norm(conformal_estimate - truth_position))
+            baseline_cov_trace[agent_id, step_id] = float(np.trace(baseline_sigma_self))
+            conformal_cov_trace[agent_id, step_id] = float(np.trace(conformal_sigma_self))
             render_altitude[agent_id, step_id] = float(current_render_altitude[agent_id])
             if controller is not None:
-                formation_position_error[agent_id, step_id] = float(
-                    np.linalg.norm(estimate - target_positions_xyz[agent_id, :2])
+                baseline_formation_position_error[agent_id, step_id] = float(
+                    np.linalg.norm(baseline_estimate - target_positions_xyz[agent_id, :2])
+                )
+                conformal_formation_position_error[agent_id, step_id] = float(
+                    np.linalg.norm(conformal_estimate - target_positions_xyz[agent_id, :2])
                 )
 
             frame_poses.append(
@@ -413,12 +979,15 @@ def simulate_class_conditional_gs_ci_rollout(
                     "agent_class": truth_robots[agent_id].agent_class.value,
                     "position_xy": truth_position.tolist(),
                     "theta": float(truth_robots[agent_id].theta),
-                    "estimated_position_xy": estimate.tolist(),
+                    "estimated_position_xy": baseline_estimate.tolist(),
+                    "calibrated_estimated_position_xy": conformal_estimate.tolist(),
                     "target_position_xyz": target_positions_xyz[agent_id].tolist(),
-                    "formation_position_error": float(formation_position_error[agent_id, step_id]),
-                    "position_error": float(position_error[agent_id, step_id]),
-                    "raw_cov_trace": float(raw_cov_trace[agent_id, step_id]),
-                    "calibrated_cov_trace": float(calibrated_cov_trace[agent_id, step_id]),
+                    "formation_position_error": float(baseline_formation_position_error[agent_id, step_id]),
+                    "calibrated_formation_position_error": float(conformal_formation_position_error[agent_id, step_id]),
+                    "position_error": float(baseline_position_error[agent_id, step_id]),
+                    "calibrated_position_error": float(conformal_position_error[agent_id, step_id]),
+                    "raw_cov_trace": float(baseline_cov_trace[agent_id, step_id]),
+                    "calibrated_cov_trace": float(conformal_cov_trace[agent_id, step_id]),
                     "quantile": float(quantile),
                     "render_z": float(current_render_altitude[agent_id]),
                     "nominal_input": [float(value) for value in nominal_inputs[agent_id]],
@@ -441,13 +1010,35 @@ def simulate_class_conditional_gs_ci_rollout(
             }
         )
 
+    online_dcp["mid_join"]["applied"] = bool(mid_join_applied)
+    final_class_quantiles = _classwise_average_from_agent_maps(
+        agent_quantile_maps=agent_quantile_maps,
+        class_order=dcp_class_order,
+    )
+    class_quantiles.update(final_class_quantiles)
+    online_dcp["final_class_quantiles"] = {
+        agent_class.value: float(value)
+        for agent_class, value in final_class_quantiles.items()
+    }
+
     # Return full rollout bundle consumed by render and plotting scripts.
     return {
         "frames": frames,
         "truth_robots": truth_robots,
-        "filters": gs_ci_robots,
+        "filters_baseline": gs_ci_baseline_robots,
+        "filters_conformal": gs_ci_conformal_robots,
+        "filters": gs_ci_conformal_robots,
         "agent_classes": [agent_class.value for agent_class in agent_classes],
+        "epsilon_by_class": {
+            agent_class.value: float(epsilon_by_class[agent_class])
+            for agent_class in epsilon_by_class.keys()
+        },
         "class_quantiles": {agent_class.value: float(q) for agent_class, q in class_quantiles.items()},
+        "final_agent_quantile_maps": [
+            {agent_class.value: float(value) for agent_class, value in agent_quantile_map.items()}
+            for agent_quantile_map in agent_quantile_maps
+        ],
+        "online_dcp": online_dcp,
         "motion_mode": motion_mode,
         "controller_name": controller_name,
         "formation_targets": formation_targets,
@@ -455,13 +1046,17 @@ def simulate_class_conditional_gs_ci_rollout(
         "target_positions_xyz": target_positions_xyz,
         "time": (np.arange(num_steps, dtype=float) * dt),
         "truth_positions": truth_positions,
-        "estimated_positions": estimated_positions,
-        "raw_covariances": raw_covariances,
+        "estimated_positions": baseline_estimated_positions,
+        "calibrated_estimated_positions": conformal_estimated_positions,
+        "raw_covariances": baseline_covariances,
+        "calibrated_covariances": conformal_covariances,
         "render_altitude": render_altitude,
-        "formation_position_error": formation_position_error,
-        "position_error": position_error,
-        "raw_cov_trace": raw_cov_trace,
-        "calibrated_cov_trace": calibrated_cov_trace,
+        "formation_position_error": baseline_formation_position_error,
+        "calibrated_formation_position_error": conformal_formation_position_error,
+        "position_error": baseline_position_error,
+        "calibrated_position_error": conformal_position_error,
+        "raw_cov_trace": baseline_cov_trace,
+        "calibrated_cov_trace": conformal_cov_trace,
         "observ_topology_edges": [edge.copy() for edge in observ_topology.edges],
         "comm_topology_edges": [edge.copy() for edge in comm_topology.edges],
     }
