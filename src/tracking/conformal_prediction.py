@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.stats import chi2
 
 
 class ConformalPredictionModule:
@@ -36,6 +37,8 @@ class ConformalPredictionModule:
         mean: np.ndarray,
         covariance: np.ndarray,
         truth: np.ndarray,
+        alpha: float | None = None,
+        normalize_by_chi2: bool = True,
     ) -> float:
         """Compute Mahalanobis distance between truth and mean given covariance."""
         mean = np.array(mean, dtype=float)
@@ -52,7 +55,16 @@ class ConformalPredictionModule:
         diff = truth.reshape(-1) - mean.reshape(-1)
         inv_cov = np.linalg.inv(covariance)
         score = float(np.sqrt(diff.T @ inv_cov @ diff))
-        return score
+
+        if not bool(normalize_by_chi2):
+            return score
+
+        alpha_eff = self.alpha if alpha is None else float(alpha)
+        alpha_eff = min(max(alpha_eff, 1.0e-12), 1.0 - 1.0e-12)
+        chi2_cutoff = float(chi2.ppf(1.0 - alpha_eff, df=mean.size))
+        if not np.isfinite(chi2_cutoff) or chi2_cutoff <= 0.0:
+            return score
+        return float(score / np.sqrt(chi2_cutoff))
 
     def quantile(self, alpha: float) -> float:
         """Return conformal quantile for miscoverage alpha."""

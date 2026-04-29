@@ -79,6 +79,43 @@ class GS_CI:
 		# augmented with an explicit orientation state.
 		return matrix(np.eye(self.s.shape[0], dtype=float))
 
+	def _extract_neighbor_payload(self, neighbor):
+		"""Normalize a neighbor payload from dict/object form."""
+		if isinstance(neighbor, dict):
+			neighbor_state = neighbor.get("s")
+			neighbor_sigma = neighbor.get("sigma")
+			neighbor_th_sigma = neighbor.get("th_sigma", neighbor_sigma)
+			neighbor_class = neighbor.get("agent_class", self.agent_class)
+		else:
+			neighbor_state = getattr(neighbor, "s", None)
+			neighbor_sigma = getattr(neighbor, "sigma", None)
+			neighbor_th_sigma = getattr(neighbor, "th_sigma", neighbor_sigma)
+			neighbor_class = getattr(neighbor, "agent_class", self.agent_class)
+
+		if neighbor_state is None or neighbor_sigma is None:
+			raise ValueError("Each neighbor must provide state `s` and covariance `sigma`")
+
+		return (
+			matrix(neighbor_state, dtype=float),
+			self._symmetrize(neighbor_sigma),
+			self._symmetrize(neighbor_th_sigma),
+			normalize_agent_class(neighbor_class),
+		)
+
+	def _batch_ci_weights(self, neighbor_count, ci_coeff=None):
+		"""Compute convex CI weights for local + neighbor sources."""
+		neighbor_count = int(neighbor_count)
+		if neighbor_count < 0:
+			raise ValueError("neighbor_count must be nonnegative")
+		if neighbor_count == 0:
+			return [1.0]
+		if ci_coeff is None:
+			uniform = 1.0 / float(neighbor_count + 1)
+			return [uniform] * (neighbor_count + 1)
+		local_weight = min(max(float(ci_coeff), 0.0), 1.0)
+		neighbor_weight = (1.0 - local_weight) / float(neighbor_count)
+		return [local_weight] + [neighbor_weight] * neighbor_count
+
 	def motion_propagation_update(self, odometry_input, dt):
 
 		[v, omega] = odometry_input
@@ -158,74 +195,110 @@ class GS_CI:
 
 	def comm_update(
 		self,
-		comm_robot_s,
-		comm_robot_sigma,
-		comm_robot_th_sigma,
+		comm_robot_s=None,
+		comm_robot_sigma=None,
+		comm_robot_th_sigma=None,
 		comm_robot_class=None,
 		class_quantiles=None,
 		ci_coeff=None,
 		use_quantiles=True,
+		neighbor_data=None,
 	):
-		"""Fuse a communicated estimate using class-conditional calibrated CI.
+		"""Fuse communicated estimates with one-shot batch covariance intersection.
 
-		The current GS-CI simulator stores only planar positions in ``self.s``.
-		Therefore the orientation masking matrices from the paper reduce to the
-		identity by default. The helper hooks remain in place for a future
-		orientation-augmented state implementation.
+		The preferred path is ``neighbor_data=[...]`` where each payload provides
+		``s``, ``sigma``, and ``agent_class`` (and optional ``th_sigma``). For
+		backward compatibility, a single neighbor can still be passed through the
+		legacy scalar arguments.
 		"""
 
-		ci_coeff = self.ci_coeff if ci_coeff is None else float(ci_coeff)
-		remote_state = matrix(comm_robot_s, dtype=float)
-		remote_class = normalize_agent_class(comm_robot_class or self.agent_class)
 		use_quantiles = bool(use_quantiles)
+		if neighbor_data is None:
+			if comm_robot_s is None or comm_robot_sigma is None:
+				return self.s, self.sigma
+			neighbor_data = [
+				{
+					"s": comm_robot_s,
+					"sigma": comm_robot_sigma,
+					"th_sigma": comm_robot_th_sigma,
+					"agent_class": comm_robot_class,
+				}
+			]
+
+		neighbor_payloads = list(neighbor_data)
 
 		quantiles = {}
 		if use_quantiles:
 			quantiles = self.class_quantiles.copy()
 			quantiles.update(self._normalize_quantile_map(class_quantiles))
-			local_sigma_tilde = self._calibrated_covariance(
-				self.sigma,
-				agent_class=self.agent_class,
-				class_quantiles=quantiles,
-			)
-			remote_sigma_tilde = self._calibrated_covariance(
-				comm_robot_sigma,
-				agent_class=remote_class,
-				class_quantiles=quantiles,
-			)
-		else:
-			local_sigma_tilde = self._symmetrize(self.sigma)
-			remote_sigma_tilde = self._symmetrize(comm_robot_sigma)
+
+		def _calibrate_sigma(sigma_value, source_class):
+			if not use_quantiles:
+				return self._symmetrize(sigma_value)
+			scale = float(quantiles.get(normalize_agent_class(source_class), 1.0))
+			return self._symmetrize(scale * np.asarray(sigma_value, dtype=float))
 
 		T_j_minus = self._sender_orientation_mask()
 		T_i_plus = self._receiver_orientation_mask()
 
-		remote_reduced_sigma = self._symmetrize(T_j_minus * remote_sigma_tilde * T_j_minus.T)
-		remote_information_reduced = self._stable_information(remote_reduced_sigma)
-		incoming_information = self._symmetrize(T_i_plus * remote_information_reduced * T_i_plus.T)
-		incoming_information_vector = T_i_plus * remote_information_reduced * T_j_minus * remote_state
-
+		local_sigma_tilde = _calibrate_sigma(self.sigma, self.agent_class)
 		local_information = self._stable_information(local_sigma_tilde)
 		local_information_vector = local_information * self.s
 
-		fused_information = self._symmetrize(ci_coeff * local_information + (1 - ci_coeff) * incoming_information)
-		fused_covariance = self._symmetrize(self._stable_information(fused_information))
-		fused_state = fused_covariance * (
-			ci_coeff * local_information_vector + (1 - ci_coeff) * incoming_information_vector
+		local_th_sigma_tilde = _calibrate_sigma(self.th_sigma, self.agent_class)
+		local_th_information = self._stable_information(local_th_sigma_tilde)
+
+		calibrated_info_matrices = [local_information]
+		calibrated_info_vectors = [local_information_vector]
+		calibrated_th_info_matrices = [local_th_information]
+
+		for neighbor in neighbor_payloads:
+			neighbor_state, neighbor_sigma, neighbor_th_sigma, neighbor_class = self._extract_neighbor_payload(neighbor)
+
+			calibrated_neighbor_sigma = _calibrate_sigma(neighbor_sigma, neighbor_class)
+			neighbor_info_reduced = self._stable_information(
+				self._symmetrize(T_j_minus * calibrated_neighbor_sigma * T_j_minus.T)
+			)
+			neighbor_info_matrix = self._symmetrize(T_i_plus * neighbor_info_reduced * T_i_plus.T)
+			neighbor_info_vector = T_i_plus * neighbor_info_reduced * T_j_minus * neighbor_state
+
+			calibrated_info_matrices.append(neighbor_info_matrix)
+			calibrated_info_vectors.append(neighbor_info_vector)
+
+			calibrated_neighbor_th_sigma = _calibrate_sigma(neighbor_th_sigma, neighbor_class)
+			neighbor_th_info_reduced = self._stable_information(
+				self._symmetrize(T_j_minus * calibrated_neighbor_th_sigma * T_j_minus.T)
+			)
+			neighbor_th_info_matrix = self._symmetrize(T_i_plus * neighbor_th_info_reduced * T_i_plus.T)
+			calibrated_th_info_matrices.append(neighbor_th_info_matrix)
+
+		weights = self._batch_ci_weights(
+			neighbor_count=len(neighbor_payloads),
+			ci_coeff=ci_coeff,
 		)
+
+		fused_information = matrix(np.zeros_like(np.asarray(self.sigma, dtype=float)))
+		fused_information_vector = matrix(np.zeros_like(np.asarray(self.s, dtype=float)))
+		fused_th_information = matrix(np.zeros_like(np.asarray(self.th_sigma, dtype=float)))
+
+		for weight, info_matrix, info_vector, th_info_matrix in zip(
+			weights,
+			calibrated_info_matrices,
+			calibrated_info_vectors,
+			calibrated_th_info_matrices,
+		):
+			fused_information += float(weight) * info_matrix
+			fused_information_vector += float(weight) * info_vector
+			fused_th_information += float(weight) * th_info_matrix
+
+		fused_information = self._symmetrize(fused_information)
+		fused_th_information = self._symmetrize(fused_th_information)
+		fused_covariance = self._symmetrize(self._stable_information(fused_information))
+		fused_state = fused_covariance * fused_information_vector
+		fused_th_covariance = self._symmetrize(self._stable_information(fused_th_information))
 
 		self.s = fused_state
 		self.sigma = fused_covariance
+		self.th_sigma = fused_th_covariance
 
-		if use_quantiles and quantiles:
-			q_sup = max(float(value) for value in quantiles.values())
-			local_th_sigma_tilde = self._symmetrize(q_sup * np.asarray(self.th_sigma, dtype=float))
-			remote_th_sigma_tilde = self._symmetrize(q_sup * np.asarray(comm_robot_th_sigma, dtype=float))
-		else:
-			local_th_sigma_tilde = self._symmetrize(self.th_sigma)
-			remote_th_sigma_tilde = self._symmetrize(comm_robot_th_sigma)
-		fused_th_information = self._symmetrize(
-			ci_coeff * self._stable_information(local_th_sigma_tilde)
-			+ (1 - ci_coeff) * self._stable_information(remote_th_sigma_tilde)
-		)
-		self.th_sigma = self._symmetrize(self._stable_information(fused_th_information))
+		return self.s, self.sigma

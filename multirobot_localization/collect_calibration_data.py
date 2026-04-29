@@ -10,10 +10,12 @@ from pathlib import Path
 
 import numpy as np
 from scipy import linalg
+from scipy.stats import chi2
 
 import sim_env
 from agent_classes import DEFAULT_AGENT_CLASS_PROFILES, AgentClass
 from algorithm.gs_ci import GS_CI
+from formation_control import EstimateDrivenFormationController, default_formation_targets
 from heterogeneous_scenario import (
     BEARING_OUTLIER_PROB,
     BEARING_OUTLIER_SCALE,
@@ -105,6 +107,12 @@ def parse_args() -> argparse.Namespace:
             "Defaults to <output_stem>_score_histogram.png next to --output."
         ),
     )
+    parser.add_argument(
+        "--motion-mode",
+        choices=("formation", "random"),
+        default="random",
+        help="Motion model used to generate calibration trajectories.",
+    )
     return parser.parse_args()
 
 
@@ -136,8 +144,13 @@ def flatten_covariance(covariance) -> list[list[float]]:
     return np.asarray(covariance, dtype=float).tolist()
 
 
-def mahalanobis_radius(mean: np.ndarray, covariance: np.ndarray, truth: np.ndarray) -> float:
-    # Nonconformity score used by CP: Mahalanobis radius in the local 2D agent state.
+def mahalanobis_radius(
+    mean: np.ndarray,
+    covariance: np.ndarray,
+    truth: np.ndarray,
+    epsilon: float | None = None,
+) -> float:
+    # Nonconformity score used by CP: Mahalanobis radius normalized by chi-square cutoff.
     mean = np.asarray(mean, dtype=float).reshape(-1)
     truth = np.asarray(truth, dtype=float).reshape(-1)
     covariance = np.asarray(covariance, dtype=float)
@@ -146,7 +159,15 @@ def mahalanobis_radius(mean: np.ndarray, covariance: np.ndarray, truth: np.ndarr
     diff = truth - mean
     inv_covariance = np.linalg.pinv(covariance)
     distance_sq = float(diff.T @ inv_covariance @ diff)
-    return float(np.sqrt(max(distance_sq, 0.0)))
+    radius = float(np.sqrt(max(distance_sq, 0.0)))
+    if epsilon is None:
+        return radius
+
+    epsilon = min(max(float(epsilon), 1.0e-12), 1.0 - 1.0e-12)
+    chi2_cutoff = float(chi2.ppf(1.0 - epsilon, df=diff.size))
+    if not np.isfinite(chi2_cutoff) or chi2_cutoff <= 0.0:
+        return radius
+    return float(radius / np.sqrt(chi2_cutoff))
 
 
 def noisy_relative_measurement(
@@ -224,6 +245,11 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
         )
     ]
     landmark_position_xy = np.asarray(landmarks[0].position, dtype=float).reshape(-1)
+    controller = None
+    if args.motion_mode == "formation":
+        controller = EstimateDrivenFormationController(
+            formation_targets=default_formation_targets(agent_classes),
+        )
 
     dataset_by_class: dict[str, list[dict[str, object]]] = {
         agent_class.value: [] for agent_class in AgentClass
@@ -253,11 +279,31 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
             realized_inputs = [None] * sim_env.N
             # Sample noisy controls and evolve truth + filter predictions.
             for agent_id, robot in enumerate(truth_robots):
-                nominal_inputs[agent_id], realized_inputs[agent_id] = sample_odometry_input(
-                    robot=robot,
-                    dt=sim_env.dt,
-                    rng=episode_rng,
-                )
+                if controller is None:
+                    nominal_inputs[agent_id], realized_inputs[agent_id] = sample_odometry_input(
+                        robot=robot,
+                        dt=sim_env.dt,
+                        rng=episode_rng,
+                    )
+                else:
+                    ii = 2 * agent_id
+                    estimated_self_position = np.asarray(
+                        local_filters[agent_id].s[ii:ii + 2],
+                        dtype=float,
+                    ).reshape(-1)
+                    nominal_inputs[agent_id] = controller.compute_nominal_input(
+                        agent_id=agent_id,
+                        estimated_position_xy=estimated_self_position,
+                        current_theta=local_filters[agent_id].theta,
+                        robot=robot,
+                        dt=sim_env.dt,
+                    )
+                    realized_inputs[agent_id] = controller.sample_realized_input(
+                        robot=robot,
+                        nominal_input=nominal_inputs[agent_id],
+                        dt=sim_env.dt,
+                        rng=episode_rng,
+                    )
 
             for agent_id in range(sim_env.N):
                 truth_robots[agent_id].motion_propagation(realized_inputs[agent_id], sim_env.dt)
@@ -331,6 +377,8 @@ def collect_dataset(args: argparse.Namespace) -> dict[str, object]:
             "burn_in_steps": int(args.burn_in),
             "relative_observ_prob": float(args.relative_observ_prob),
             "landmark_observ_prob": float(args.landmark_observ_prob),
+            "motion_mode": str(args.motion_mode),
+            "controller_name": "random_odometry" if controller is None else controller.name,
             "agent_profiles": {
                 agent_class.value: DEFAULT_AGENT_CLASS_PROFILES[agent_class].to_dict()
                 for agent_class in AgentClass
@@ -496,7 +544,7 @@ def load_calibration_dataset(path: Path) -> dict[str, object]:
 def print_all_sample_scores(dataset: dict[str, object]) -> None:
     # Print every calibration sample with truth, posterior, covariance, and CP score.
     samples_by_class = dataset["samples_by_class"]
-    print("Calibration samples with CP scores:")
+    print("Calibration samples with CP scores (chi-square normalized):")
     for class_name in sorted(samples_by_class.keys()):
         samples = samples_by_class[class_name]
         print(f"[{class_name}] {len(samples)} samples")
@@ -513,6 +561,7 @@ def print_all_sample_scores(dataset: dict[str, object]) -> None:
                 mean=mean_xy,
                 covariance=covariance_xy,
                 truth=truth_xy,
+                epsilon=float(sample["epsilon"]),
             )
             truth_repr = np.array2string(truth_xy, precision=6, separator=", ")
             mean_repr = np.array2string(mean_xy, precision=6, separator=", ")
@@ -561,6 +610,7 @@ def save_score_histogram(dataset: dict[str, object], output_path: Path) -> None:
                 mean=posterior_mean[ii:ii + 2],
                 covariance=posterior_covariance[ii:ii + 2, ii:ii + 2],
                 truth=truth_state[ii:ii + 2],
+                epsilon=float(sample["epsilon"]),
             )
             class_scores.append(float(score))
         scores_by_class[class_name] = np.asarray(class_scores, dtype=float)
@@ -577,7 +627,7 @@ def save_score_histogram(dataset: dict[str, object], output_path: Path) -> None:
         if class_scores.size == 0:
             ax.text(0.5, 0.5, "No samples", ha="center", va="center")
             ax.set_title(class_name)
-            ax.set_xlabel("score")
+            ax.set_xlabel("normalized score")
             ax.set_ylabel("count")
             ax.grid(alpha=0.25)
             continue
@@ -591,14 +641,14 @@ def save_score_histogram(dataset: dict[str, object], output_path: Path) -> None:
             alpha=0.8,
         )
         ax.set_title(f"{class_name} (n={class_scores.size})")
-        ax.set_xlabel("score")
+        ax.set_xlabel("normalized score")
         ax.set_ylabel("count")
         ax.grid(alpha=0.25)
 
     for idx in range(num_classes, len(flat_axes)):
         flat_axes[idx].axis("off")
 
-    fig.suptitle("Calibration Score Histograms by Agent Class", fontsize=14)
+    fig.suptitle("Calibration Score Histograms by Agent Class (Chi-square Normalized)", fontsize=14)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)

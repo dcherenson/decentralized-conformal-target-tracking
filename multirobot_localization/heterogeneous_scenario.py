@@ -6,6 +6,7 @@ from math import atan2, cos, sin
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import chi2
 
 import sim_env
 from agent_classes import AgentClass, normalize_agent_class
@@ -26,7 +27,7 @@ BEARING_OUTLIER_SCALE = 4.0
 
 
 def default_epsilon_by_class(
-    epsilon_ugv: float = 0.05,
+    epsilon_ugv: float = 0.10,
     epsilon_uav: float = 0.10,
 ) -> dict[AgentClass, float]:
     # Class-conditioned nominal error rates used by downstream calibration logic.
@@ -201,7 +202,12 @@ def _split_conformal_quantile(scores: np.ndarray, alpha: float) -> tuple[float, 
     return float(np.quantile(scores, tau, method="higher")), tau
 
 
-def _mahalanobis_radius(mean: np.ndarray, covariance: np.ndarray, truth: np.ndarray) -> float:
+def _mahalanobis_radius(
+    mean: np.ndarray,
+    covariance: np.ndarray,
+    truth: np.ndarray,
+    epsilon: float | None = None,
+) -> float:
     mean = np.asarray(mean, dtype=float).reshape(-1)
     truth = np.asarray(truth, dtype=float).reshape(-1)
     covariance = np.asarray(covariance, dtype=float)
@@ -210,7 +216,15 @@ def _mahalanobis_radius(mean: np.ndarray, covariance: np.ndarray, truth: np.ndar
     diff = truth - mean
     inv_covariance = np.linalg.pinv(covariance)
     distance_sq = float(diff.T @ inv_covariance @ diff)
-    return float(np.sqrt(max(distance_sq, 0.0)))
+    radius = float(np.sqrt(max(distance_sq, 0.0)))
+    if epsilon is None:
+        return radius
+
+    epsilon = min(max(float(epsilon), 1.0e-12), 1.0 - 1.0e-12)
+    chi2_cutoff = float(chi2.ppf(1.0 - epsilon, df=diff.size))
+    if not np.isfinite(chi2_cutoff) or chi2_cutoff <= 0.0:
+        return radius
+    return float(radius / np.sqrt(chi2_cutoff))
 
 
 def _doubly_stochastic_weights_from_comm_edges(
@@ -309,6 +323,7 @@ def _load_classwise_calibration_score_pools(
                 mean=posterior_mean[state_index:state_index + 2],
                 covariance=posterior_covariance[state_index:state_index + 2, state_index:state_index + 2],
                 truth=truth_state[state_index:state_index + 2],
+                epsilon=float(sample["epsilon"]),
             )
             class_scores[agent_class].append(score)
             alpha_by_class[agent_class] = float(sample["epsilon"])
@@ -927,22 +942,51 @@ def simulate_class_conditional_gs_ci_rollout(
                 baseline_filter.rela_obsv_update(observed_idx, measurement)
                 conformal_filter.rela_obsv_update(observed_idx, measurement)
 
-        # Communication update for sampled message-passing edges.
+        # Communication update with pre-comm transmission buffers.
+        # This prevents within-step sender overwrite from contaminating later receivers.
+        baseline_tx_buffer = [
+            {
+                "agent_id": int(agent_id),
+                "agent_class": gs_ci_baseline_robots[agent_id].agent_class,
+                "s": gs_ci_baseline_robots[agent_id].s.copy(),
+                "sigma": gs_ci_baseline_robots[agent_id].sigma.copy(),
+                "th_sigma": gs_ci_baseline_robots[agent_id].th_sigma.copy(),
+            }
+            for agent_id in range(sim_env.N)
+        ]
+        conformal_tx_buffer = [
+            {
+                "agent_id": int(agent_id),
+                "agent_class": gs_ci_conformal_robots[agent_id].agent_class,
+                "s": gs_ci_conformal_robots[agent_id].s.copy(),
+                "sigma": gs_ci_conformal_robots[agent_id].sigma.copy(),
+                "th_sigma": gs_ci_conformal_robots[agent_id].th_sigma.copy(),
+            }
+            for agent_id in range(sim_env.N)
+        ]
+
+        baseline_neighbors_by_receiver = {agent_id: [] for agent_id in range(sim_env.N)}
+        conformal_neighbors_by_receiver = {agent_id: [] for agent_id in range(sim_env.N)}
         for sender_idx, receiver_idx in comm_topology.edges:
-            gs_ci_baseline_robots[receiver_idx].comm_update(
-                gs_ci_baseline_robots[sender_idx].s,
-                gs_ci_baseline_robots[sender_idx].sigma,
-                gs_ci_baseline_robots[sender_idx].th_sigma,
-                comm_robot_class=gs_ci_baseline_robots[sender_idx].agent_class,
-                use_quantiles=False,
-            )
-            gs_ci_conformal_robots[receiver_idx].comm_update(
-                gs_ci_conformal_robots[sender_idx].s,
-                gs_ci_conformal_robots[sender_idx].sigma,
-                gs_ci_conformal_robots[sender_idx].th_sigma,
-                comm_robot_class=gs_ci_conformal_robots[sender_idx].agent_class,
-                class_quantiles=None,
-            )
+            baseline_neighbors_by_receiver[receiver_idx].append(baseline_tx_buffer[sender_idx])
+            conformal_neighbors_by_receiver[receiver_idx].append(conformal_tx_buffer[sender_idx])
+
+        conformal_received_comm = np.zeros((sim_env.N,), dtype=bool)
+        for receiver_idx in range(sim_env.N):
+            baseline_neighbors = baseline_neighbors_by_receiver[receiver_idx]
+            conformal_neighbors = conformal_neighbors_by_receiver[receiver_idx]
+            if baseline_neighbors:
+                gs_ci_baseline_robots[receiver_idx].comm_update(
+                    neighbor_data=baseline_neighbors,
+                    use_quantiles=False,
+                )
+            if conformal_neighbors:
+                gs_ci_conformal_robots[receiver_idx].comm_update(
+                    neighbor_data=conformal_neighbors,
+                    class_quantiles=None,
+                    use_quantiles=True,
+                )
+                conformal_received_comm[receiver_idx] = True
 
         # Collect per-agent diagnostics for plotting/rendering.
         frame_poses = []
@@ -954,6 +998,9 @@ def simulate_class_conditional_gs_ci_rollout(
             baseline_sigma_self = np.asarray(gs_ci_baseline_robots[agent_id].sigma[ii:ii + 2, ii:ii + 2], dtype=float)
             conformal_sigma_self = np.asarray(gs_ci_conformal_robots[agent_id].sigma[ii:ii + 2, ii:ii + 2], dtype=float)
             quantile = gs_ci_conformal_robots[agent_id].get_class_quantile(agent_class=agent_classes[agent_id])
+            if not conformal_received_comm[agent_id]:
+                conformal_sigma_self = float(quantile) * conformal_sigma_self
+                conformal_sigma_self = 0.5 * (conformal_sigma_self + conformal_sigma_self.T)
 
             truth_positions[agent_id, step_id] = truth_position
             baseline_estimated_positions[agent_id, step_id] = baseline_estimate

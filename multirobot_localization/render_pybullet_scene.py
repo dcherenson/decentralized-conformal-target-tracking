@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import chi2, norm
 
 import sim_env
 from agent_classes import AgentClass, normalize_agent_class
@@ -246,7 +247,13 @@ def parse_args() -> argparse.Namespace:
         "--tube-alpha",
         type=float,
         default=0.18,
-        help="Transparency used for cooperative-localization uncertainty tube overlays.",
+        help="Transparency used for cooperative-localization ellipse overlays.",
+    )
+    parser.add_argument(
+        "--ellipse-step",
+        type=int,
+        default=10,
+        help="Draw 1-epsilon covariance ellipses every N timesteps in the top-down plot.",
     )
     parser.add_argument(
         "--motion-mode",
@@ -646,57 +653,50 @@ def extract_startup_quantile_history(rollout: dict[str, object]) -> np.ndarray |
     return candidate[:num_agents]
 
 
-def tangent_normals(points: np.ndarray) -> np.ndarray:
-    # Estimate per-point curve normals from finite-difference tangents.
-    tangents = np.zeros_like(points)
-    if points.shape[0] == 1:
-        tangents[0] = np.array([1.0, 0.0])
-    else:
-        tangents[0] = points[1] - points[0]
-        tangents[-1] = points[-1] - points[-2]
-        if points.shape[0] > 2:
-            tangents[1:-1] = points[2:] - points[:-2]
-
-    tangent_norm = np.linalg.norm(tangents, axis=1, keepdims=True)
-    tangent_norm = np.where(tangent_norm < 1.0e-9, 1.0, tangent_norm)
-    unit_tangent = tangents / tangent_norm
-    return np.column_stack((-unit_tangent[:, 1], unit_tangent[:, 0]))
-
-
-def covariance_tube_radius(
-    covariances: np.ndarray,
-    normals: np.ndarray,
-    scale: float,
-) -> np.ndarray:
-    # Project covariance along local normal direction to get tube half-width.
-    variances = np.einsum("ti,tij,tj->t", normals, covariances, normals)
-    variances = np.maximum(variances, 0.0)
-    return float(scale) * np.sqrt(variances)
-
-
-def draw_uncertainty_tube(
+def draw_covariance_ellipse(
     ax,
-    estimated_positions: np.ndarray,
-    covariances: np.ndarray,
-    scale: float,
+    mean_xy: np.ndarray,
+    covariance_xy: np.ndarray,
+    chi2_cutoff: float,
     color,
     alpha: float,
+    linewidth: float = 1.0,
 ) -> None:
-    # Draw a closed polygon around the estimated trajectory centerline.
-    normals = tangent_normals(estimated_positions)
-    radius = covariance_tube_radius(covariances, normals, scale=scale)
-    upper = estimated_positions + normals * radius[:, None]
-    lower = estimated_positions - normals * radius[:, None]
-    polygon = np.vstack((upper, lower[::-1]))
-    ax.fill(polygon[:, 0], polygon[:, 1], color=color, alpha=alpha, linewidth=0.0)
+    # Draw a 2D covariance ellipse defined by (x-mu)^T Sigma^{-1} (x-mu) <= chi2_cutoff.
+    from matplotlib.patches import Ellipse
+
+    covariance_xy = np.asarray(covariance_xy, dtype=float)
+    covariance_xy = 0.5 * (covariance_xy + covariance_xy.T)
+    eigvals, eigvecs = np.linalg.eigh(covariance_xy)
+    eigvals = np.maximum(eigvals, 0.0)
+    major_idx = int(np.argmax(eigvals))
+    minor_idx = 1 - major_idx
+
+    major_len = 2.0 * np.sqrt(float(chi2_cutoff) * float(eigvals[major_idx]))
+    minor_len = 2.0 * np.sqrt(float(chi2_cutoff) * float(eigvals[minor_idx]))
+    major_vec = eigvecs[:, major_idx]
+    angle_deg = float(np.degrees(np.arctan2(major_vec[1], major_vec[0])))
+
+    patch = Ellipse(
+        xy=(float(mean_xy[0]), float(mean_xy[1])),
+        width=float(major_len),
+        height=float(minor_len),
+        angle=angle_deg,
+        facecolor=color,
+        edgecolor=color,
+        alpha=float(alpha),
+        linewidth=float(linewidth),
+    )
+    ax.add_patch(patch)
 
 
 def save_top_down_uncertainty_tubes_plot(
     rollout: dict[str, object],
     output_path: Path,
     tube_alpha: float = 0.18,
+    ellipse_step: int = 10,
 ):
-    # Side-by-side figure: baseline GS-CI vs conformalized GS-CI uncertainty tubes.
+    # Side-by-side figure: baseline vs conformalized 1-epsilon ellipses every N steps.
     mplconfig_dir = output_path.parent / ".mplconfig"
     mplconfig_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(mplconfig_dir))
@@ -731,6 +731,20 @@ def save_top_down_uncertainty_tubes_plot(
 
     quantile_history = extract_agent_quantile_history(rollout)
     final_scales = quantile_history[:, -1] if quantile_history.shape[1] > 0 else np.ones(num_agents, dtype=float)
+    ellipse_step = max(1, int(ellipse_step))
+    num_steps = int(truth_positions.shape[1])
+    sampled_steps = np.arange(0, num_steps, ellipse_step, dtype=int)
+
+    epsilon_raw = rollout.get("epsilon_by_class", {})
+    epsilon_by_class: dict[str, float] = {}
+    if isinstance(epsilon_raw, dict):
+        for class_name, epsilon in epsilon_raw.items():
+            epsilon_by_class[str(class_name)] = float(epsilon)
+    if not epsilon_by_class:
+        epsilon_by_class = {
+            AgentClass.CLASS_A_UGV.value: 0.05,
+            AgentClass.CLASS_B_UAV.value: 0.10,
+        }
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 7), sharex=True, sharey=True)
     subplot_specs = [
@@ -757,14 +771,39 @@ def save_top_down_uncertainty_tubes_plot(
             color = colors[agent_id]
             truth_xy = truth_positions[agent_id]
             estimate_xy = estimate_bank[agent_id]
-            draw_uncertainty_tube(
-                ax=ax,
-                estimated_positions=estimate_xy,
-                covariances=covariance_bank[agent_id],
-                scale=float(scales[agent_id]),
-                color=color,
-                alpha=tube_alpha,
-            )
+            class_name = str(agent_classes[agent_id])
+            epsilon = min(max(float(epsilon_by_class.get(class_name, 0.10)), 1.0e-12), 1.0 - 1.0e-12)
+            chi2_cutoff = float(chi2.ppf(1.0 - epsilon, df=2))
+
+            for step_id in sampled_steps:
+                mean_xy = np.asarray(estimate_xy[step_id], dtype=float)
+                covariance_xy = np.asarray(covariance_bank[agent_id, step_id], dtype=float)
+                covariance_xy = 0.5 * (covariance_xy + covariance_xy.T) + 1.0e-12 * np.eye(2, dtype=float)
+                covariance_xy = (float(scales[agent_id]) ** 2) * covariance_xy
+
+                draw_covariance_ellipse(
+                    ax=ax,
+                    mean_xy=mean_xy,
+                    covariance_xy=covariance_xy,
+                    chi2_cutoff=chi2_cutoff,
+                    color=color,
+                    alpha=tube_alpha,
+                    linewidth=0.9,
+                )
+
+                diff = np.asarray(truth_xy[step_id], dtype=float) - mean_xy
+                mahal_sq = float(diff.T @ np.linalg.pinv(covariance_xy) @ diff)
+                if mahal_sq > chi2_cutoff:
+                    ax.scatter(
+                        truth_xy[step_id, 0],
+                        truth_xy[step_id, 1],
+                        color="red",
+                        marker="x",
+                        s=42,
+                        linewidths=1.6,
+                        zorder=6,
+                    )
+
             ax.plot(truth_xy[:, 0], truth_xy[:, 1], color=color, linewidth=2.2)
             ax.plot(estimate_xy[:, 0], estimate_xy[:, 1], color=color, linewidth=1.7, linestyle="--")
             ax.scatter(truth_xy[0, 0], truth_xy[0, 1], color=color, s=18, zorder=5)
@@ -797,10 +836,14 @@ def save_top_down_uncertainty_tubes_plot(
     style_handles = [
         Line2D([0], [0], color="black", linewidth=2.2, label="True trajectory"),
         Line2D([0], [0], color="black", linewidth=1.7, linestyle="--", label="Estimated trajectory"),
-        Patch(facecolor=(0.5, 0.5, 0.5, tube_alpha), edgecolor="none", label="Uncertainty tube"),
+        Patch(facecolor=(0.5, 0.5, 0.5, tube_alpha), edgecolor=(0.5, 0.5, 0.5), label="1-epsilon ellipse"),
+        Line2D([0], [0], color="red", marker="x", linestyle="None", markersize=7, label="Miscoverage"),
     ]
     fig.legend(handles=style_handles + class_handles, loc="upper center", ncol=4, frameon=False)
-    fig.suptitle("Cooperative Localization Trajectories: Baseline vs Conformalized GS-CI", y=0.98)
+    fig.suptitle(
+        f"Cooperative Localization: 1-epsilon Ellipses Every {ellipse_step} Steps",
+        y=0.98,
+    )
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -1198,6 +1241,171 @@ def save_per_agent_covariance_plot(
     plt.close(fig)
 
 
+def save_per_agent_position_time_uncertainty_plot(
+    rollout: dict[str, object],
+    output_dir: Path,
+):
+    # Save one x/y error-vs-time plot per agent with baseline vs distributed-calibrated uncertainty bands.
+    truth_positions = np.asarray(rollout.get("truth_positions", []), dtype=float)
+    baseline_estimated_positions = np.asarray(rollout.get("estimated_positions", []), dtype=float)
+    baseline_covariances = np.asarray(rollout.get("raw_covariances", []), dtype=float)
+    calibrated_estimated_positions_raw = rollout.get("calibrated_estimated_positions")
+    calibrated_covariances_raw = rollout.get("calibrated_covariances")
+    calibrated_estimated_positions = (
+        np.asarray(calibrated_estimated_positions_raw, dtype=float)
+        if calibrated_estimated_positions_raw is not None
+        else baseline_estimated_positions
+    )
+    calibrated_covariances = (
+        np.asarray(calibrated_covariances_raw, dtype=float)
+        if calibrated_covariances_raw is not None
+        else baseline_covariances
+    )
+    agent_classes = [str(value) for value in rollout.get("agent_classes", [])]
+    time_axis = np.asarray(rollout.get("time", []), dtype=float)
+    epsilon_raw = rollout.get("epsilon_by_class", {})
+
+    if truth_positions.ndim != 3 or baseline_estimated_positions.shape != truth_positions.shape:
+        return
+    if baseline_covariances.ndim != 4 or baseline_covariances.shape[:2] != truth_positions.shape[:2]:
+        return
+    if calibrated_estimated_positions.shape != truth_positions.shape:
+        calibrated_estimated_positions = baseline_estimated_positions
+    if calibrated_covariances.shape[:2] != truth_positions.shape[:2]:
+        calibrated_covariances = baseline_covariances
+
+    num_agents, num_steps, state_dim = truth_positions.shape
+    if num_steps <= 0 or state_dim < 2:
+        return
+    if time_axis.shape[0] != num_steps:
+        time_axis = np.arange(num_steps, dtype=float)
+
+    epsilon_by_class: dict[str, float] = {}
+    if isinstance(epsilon_raw, dict):
+        for class_name, epsilon in epsilon_raw.items():
+            epsilon_by_class[str(class_name)] = float(epsilon)
+    if not epsilon_by_class:
+        epsilon_by_class = {
+            AgentClass.CLASS_A_UGV.value: 0.05,
+            AgentClass.CLASS_B_UAV.value: 0.10,
+        }
+
+    mplconfig_dir = output_dir / ".mplconfig"
+    mplconfig_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mplconfig_dir))
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    for agent_id in range(num_agents):
+        class_name = agent_classes[agent_id] if agent_id < len(agent_classes) else AgentClass.CLASS_A_UGV.value
+        epsilon = min(max(float(epsilon_by_class.get(class_name, 0.10)), 1.0e-12), 1.0 - 1.0e-12)
+        z_score = float(norm.ppf(1.0 - epsilon / 2.0))
+
+        truth_xy = truth_positions[agent_id, :, :2]
+        baseline_xy = baseline_estimated_positions[agent_id, :, :2]
+        calibrated_xy = calibrated_estimated_positions[agent_id, :, :2]
+        baseline_error_xy = baseline_xy - truth_xy
+        calibrated_error_xy = calibrated_xy - truth_xy
+
+        base_cov = np.asarray(baseline_covariances[agent_id, :, :2, :2], dtype=float)
+        conf_cov = np.asarray(calibrated_covariances[agent_id, :, :2, :2], dtype=float)
+        base_cov = 0.5 * (base_cov + np.transpose(base_cov, (0, 2, 1)))
+        conf_cov = 0.5 * (conf_cov + np.transpose(conf_cov, (0, 2, 1)))
+
+        base_sigma_x = np.sqrt(np.maximum(base_cov[:, 0, 0], 0.0))
+        base_sigma_y = np.sqrt(np.maximum(base_cov[:, 1, 1], 0.0))
+        conf_sigma_x = np.sqrt(np.maximum(conf_cov[:, 0, 0], 0.0))
+        conf_sigma_y = np.sqrt(np.maximum(conf_cov[:, 1, 1], 0.0))
+
+        base_half_x = z_score * base_sigma_x
+        base_half_y = z_score * base_sigma_y
+        conf_half_x = z_score * conf_sigma_x
+        conf_half_y = z_score * conf_sigma_y
+
+        # Use the same joint 2D baseline miscoverage criterion as terminal reporting:
+        # score = sqrt(e^T Sigma^{-1} e / chi2_{2,1-eps}) > 1.
+        chi2_cutoff = float(chi2.ppf(1.0 - epsilon, df=2))
+        joint_mis_idx: list[int] = []
+        if np.isfinite(chi2_cutoff) and chi2_cutoff > 0.0:
+            for step_id in range(num_steps):
+                covariance_xy = np.asarray(base_cov[step_id], dtype=float)
+                covariance_xy = 0.5 * (covariance_xy + covariance_xy.T) + 1.0e-12 * np.eye(2, dtype=float)
+                error_xy = baseline_error_xy[step_id]
+                mahal_sq = float(error_xy.T @ np.linalg.pinv(covariance_xy) @ error_xy)
+                if mahal_sq > chi2_cutoff:
+                    joint_mis_idx.append(step_id)
+        mis_idx = np.asarray(joint_mis_idx, dtype=int)
+
+        fig, axes = plt.subplots(2, 1, figsize=(11.0, 7.2), sharex=True)
+
+        axes[0].axhline(0.0, color="black", linewidth=1.6)
+        axes[0].plot(time_axis, baseline_error_xy[:, 0], color="#1f77b4", linewidth=1.9)
+        axes[0].plot(time_axis, calibrated_error_xy[:, 0], color="#2ca02c", linewidth=1.7, linestyle="--", label="conformal error")
+        axes[0].fill_between(time_axis, -base_half_x, base_half_x, color="#ff7f7f", alpha=0.20, label="uncalibrated band")
+        axes[0].fill_between(time_axis, -conf_half_x, conf_half_x, color="#8bcf8b", alpha=0.20, label="conformal band")
+        if mis_idx.size > 0:
+            axes[0].scatter(
+                time_axis[mis_idx],
+                baseline_error_xy[mis_idx, 0],
+                color="red",
+                marker="x",
+                s=52,
+                linewidths=1.8,
+                label="uncalibrated miss",
+            )
+        axes[0].set_ylabel("x error [m]", fontsize=13)
+        axes[0].grid(alpha=0.25)
+        axes[0].tick_params(axis="both", labelsize=11)
+
+        axes[1].axhline(0.0, color="black", linewidth=1.6)
+        axes[1].plot(time_axis, baseline_error_xy[:, 1], color="#1f77b4", linewidth=1.9)
+        axes[1].plot(time_axis, calibrated_error_xy[:, 1], color="#2ca02c", linewidth=1.7, linestyle="--")
+        axes[1].fill_between(time_axis, -base_half_y, base_half_y, color="#ff7f7f", alpha=0.20)
+        axes[1].fill_between(time_axis, -conf_half_y, conf_half_y, color="#8bcf8b", alpha=0.20)
+        if mis_idx.size > 0:
+            axes[1].scatter(
+                time_axis[mis_idx],
+                baseline_error_xy[mis_idx, 1],
+                color="red",
+                marker="x",
+                s=52,
+                linewidths=1.8,
+            )
+        axes[1].set_ylabel("y error [m]", fontsize=13)
+        axes[1].set_xlabel("time [s]", fontsize=13)
+        axes[1].grid(alpha=0.25)
+        axes[1].tick_params(axis="both", labelsize=11)
+
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            ncol=2,
+            bbox_to_anchor=(0.5, 0.98),
+            frameon=True,
+            framealpha=0.90,
+            fontsize=11,
+        )
+
+        fig.suptitle(
+            f"Agent {agent_id} Error vs Time with Baseline and Distributed-Calibrated Bands "
+            f"(epsilon={epsilon:.3f})",
+            y=0.995,
+            fontsize=15,
+        )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+        fig.savefig(
+            output_dir / f"position_time_uncertainty_agent_{agent_id}.png",
+            dpi=180,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+
 def save_metadata(output_path: Path, rollout: dict[str, object], args: argparse.Namespace):
     # Export compact run configuration + topology metadata as JSON.
     metadata = {
@@ -1223,6 +1431,7 @@ def save_metadata(output_path: Path, rollout: dict[str, object], args: argparse.
         ),
         "dcp_mid_join_samples_per_joiner": int(args.dcp_mid_join_samples_per_joiner),
         "tube_alpha": float(args.tube_alpha),
+        "ellipse_step": int(args.ellipse_step),
         "motion_mode": str(args.motion_mode),
         "controller_name": rollout["controller_name"],
         "class_quantiles": rollout["class_quantiles"],
@@ -1361,7 +1570,14 @@ def print_covariance_miscoverage_report(rollout: dict[str, object]) -> None:
                 diff = truth_positions[agent_id, step_id, :eval_dim] - estimate_xy
                 covariance = 0.5 * (covariance + covariance.T) + 1.0e-12 * np.eye(eval_dim)
                 inv_covariance = np.linalg.pinv(covariance)
-                score = float(np.sqrt(max(float(diff.T @ inv_covariance @ diff), 0.0)))
+                distance_sq = float(diff.T @ inv_covariance @ diff)
+                raw_radius = float(np.sqrt(max(distance_sq, 0.0)))
+                epsilon = min(max(float(epsilon_by_class[class_name]), 1.0e-12), 1.0 - 1.0e-12)
+                chi2_cutoff = float(chi2.ppf(1.0 - epsilon, df=eval_dim))
+                if np.isfinite(chi2_cutoff) and chi2_cutoff > 0.0:
+                    score = float(raw_radius / np.sqrt(chi2_cutoff))
+                else:
+                    score = raw_radius
                 threshold = 1.0
                 if mode == "calibrated":
                     threshold = max(float(quantile_history[agent_id, step_id]), 1.0e-12)
@@ -1483,10 +1699,15 @@ def run(args: argparse.Namespace):
             agent_classes=list(rollout["agent_classes"]),
             output_path=output_dir / "calibrated_covariance_per_agent.png",
         )
+        save_per_agent_position_time_uncertainty_plot(
+            rollout=rollout,
+            output_dir=output_dir,
+        )
         save_top_down_uncertainty_tubes_plot(
             rollout=rollout,
             output_path=output_dir / "cooperative_localization_uncertainty_tubes.png",
             tube_alpha=float(args.tube_alpha),
+            ellipse_step=int(args.ellipse_step),
         )
         save_dcp_quantiles_over_time_plot(
             rollout=rollout,
